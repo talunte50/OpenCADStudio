@@ -32,23 +32,40 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 3) 安装 Trunk（预编译二进制，快）
+      # 3) 安装 Trunk
+      #    上游用 jetli/trunk-action 装预编译二进制；若该第三方 action 失效，
+      #    会退回 cargo 源码编译（慢几分钟但稳）。
       - name: Install Trunk
         uses: jetli/trunk-action@v0.4.0
         with:
           version: 'latest'
-      #    若上面这个第三方 action 失效，删掉它、取消下面四行注释（源码编译，慢几分钟但稳）：
-      # - name: Install Trunk (fallback)
-      #   id: trunk-fallback
-      #   if: false
-      #   run: cargo install trunk --locked
 
-      # 4) 构建静态产物
+      # 4) 关键：从 Cargo.lock 读出 wasm-bindgen 的锁定版本，
+      #    再装"完全匹配"的 wasm-bindgen CLI。
+      #    trunk build 会用系统里的 wasm-bindgen 处理产物，版本不匹配
+      #    （比如 latest 对 0.2.108）会让构建在最后一步挂掉——
+      #    这正是上一次 Build with Trunk 失败的根因。
+      - name: Read wasm-bindgen version
+        id: wasm-bindgen-version
+        shell: bash
+        run: |
+          VERSION=$(sed -n '/name = "wasm-bindgen"/{n;s/version = "\(.*\)"/\1/p;q;}' Cargo.lock)
+          test -n "$VERSION" || { echo "Cargo.lock 里没找到 wasm-bindgen 版本"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "锁定 wasm-bindgen 版本: $VERSION"
+
+      # 5) 装对应版本的 wasm-bindgen CLI（必须和 Cargo.lock 完全一致）
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen-version.outputs.version }}
+
+      # 6) 构建静态产物（--locked 强制用 Cargo.lock 锁定版本，防止漂移）
       #    --dist dist      覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
       #    --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
       #    这两个必须同时给，且要和下面的部署目录 ./dist 匹配
       - name: Build with Trunk
-        run: trunk build --release --dist dist --public-url /
+        run: trunk build --locked --release --dist dist --public-url /
 
       # 5) 部署前自检：确认要上传的目录根部有 index.html
       #    没有它 EdgeOne 首页会直接 404，这一步提前暴露问题
