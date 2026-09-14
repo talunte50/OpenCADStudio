@@ -64,13 +64,11 @@ jobs:
       #    --dist dist      覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
       #    --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
       #    这两个必须同时给，且要和下面的部署目录 ./dist 匹配
-      #    RUSTFLAGS="-C lto=thin -C opt-level=s -C codegen-units=1" 在 CI 临时开 LTO，
-      #    砍 wasm 体积但不改全局 Cargo.toml（避免影响桌面端构建与 panic 策略）。
-      #    opt-level=s 比 z 更安全（z 可能破坏 wasm 的某些 inline 假设）。
+      #    LTO 已放在 .cargo/config.toml（wasm target 段）里，trunk build 会自动读，
+      #    不再需要 RUSTFLAGS 注入（RUSTFLAGS 跟 trunk 内部 embed-bitcode=no 冲突）。
       - name: Build with Trunk
         run: |
           set -e
-          export RUSTFLAGS="-C lto=thin -C opt-level=s -C codegen-units=1"
           trunk build --locked --release --dist dist --public-url /
 
       # 7) 用 binaryen 的 wasm-opt 二次优化 .wasm 文件
