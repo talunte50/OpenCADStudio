@@ -116,7 +116,7 @@ jobs:
           BASE="https://api.cloudflare.com/client/v4"
           AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
 
-          # 1) 创建 Pages 项目（已存在时 409，忽略）
+          # 1) 创建/确认 Pages 项目（已存在返回 409，忽略）
           echo "创建/确认 Cloudflare Pages 项目: $PROJECT_NAME"
           create_code=$(curl -s -o /tmp/cf_create.json -w "%{http_code}" \
             -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects" \
@@ -132,101 +132,12 @@ jobs:
             exit 1
           fi
 
-          # 2) 生成 multipart 上传请求（manifest + 文件 parts）
-          echo "扫描 ./dist 并准备 multipart 上传 ..."
-          python3 - <<'PY'
-import os, json, hashlib, mimetypes, urllib.request, urllib.error, uuid, sys
+          # 2) 上传 dist 并创建 deployment（脚本独立存放在 .github/cf_deploy.py，
+          #    避免把整段 Python 嵌进 YAML run: 块导致 column-0 heredoc 解析失败）
+          echo "上传 ./dist 并创建 deployment ..."
+          python3 .github/cf_deploy.py
 
-base = "https://api.cloudflare.com/client/v4"
-token = os.environ["CLOUDFLARE_API_TOKEN"]
-account = os.environ["CF_ACCOUNT_ID"]
-project = os.environ["PROJECT_NAME"]
-dist_dir = "dist"
-
-# 2a) 扫描所有文件，算 SHA-256，建 manifest + 唯一文件集合
-files = []
-for root, _, fnames in os.walk(dist_dir):
-    for fn in fnames:
-        p = os.path.join(root, fn)
-        rel = "/" + os.path.relpath(p, dist_dir)  # 以 / 开头
-        with open(p, "rb") as f:
-            content = f.read()
-        h = hashlib.sha256(content).hexdigest()
-        files.append((rel, h, content))
-        print(f"  {rel}  ({len(content)} bytes, sha256={h[:12]}…)")
-
-manifest = {rel: h for rel, h, _ in files}
-unique = {}  # hash -> content
-for rel, h, content in files:
-    unique[h] = content
-
-print(f"共 {len(files)} 个文件，唯一 {len(unique)} 个")
-
-# 2b) 组 multipart body
-boundary = "----cfpages" + uuid.uuid4().hex
-crlf = b"\r\n"
-parts = []
-
-# manifest part（JSON）
-m_content = json.dumps(manifest).encode()
-parts.append(
-    f"--{boundary}".encode()
-    + crlf
-    + b'Content-Disposition: form-data; name="manifest"' + crlf
-    + b"Content-Type: application/json" + crlf + crlf
-    + m_content + crlf
-)
-
-# 每个唯一文件 part（part name = SHA-256 hash）
-for h, content in unique.items():
-    mime = mimetypes.guess_type(h + ".bin")[0] or "application/octet-stream"
-    # 用真实扩展名猜更准
-    for rel in manifest:
-        if manifest[rel] == h:
-            mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
-            break
-    parts.append(
-        f"--{boundary}".encode()
-        + crlf
-        + f"Content-Disposition: form-data; name=\"{h}\"; filename=\"file\"".encode()
-        + crlf
-        + f"Content-Type: {mime}".encode() + crlf + crlf
-        + content + crlf
-    )
-
-body = b"".join(parts) + f"--{boundary}--".encode() + crlf
-
-# 2c) 调 create deployment
-url = f"{base}/accounts/{account}/pages/projects/{project}/deployments"
-req = urllib.request.Request(url, data=body, method="POST", headers={
-    "Authorization": f"Bearer {token}",
-    "Content-Type": f"multipart/form-data; boundary={boundary}",
-})
-try:
-    with urllib.request.urlopen(req, timeout=600) as r:
-        resp = json.load(r)
-except urllib.error.HTTPError as e:
-    err = e.read().decode("utf-8", "replace")
-    print(f"Create deployment failed (HTTP {e.code}):")
-    print(err[:3000])
-    sys.exit(1)
-
-if not resp.get("success"):
-    print("API returned success=false:")
-    print(json.dumps(resp.get("errors", resp), indent=2)[:3000])
-    sys.exit(1)
-
-dep = resp["result"]
-dep_id = dep.get("id")
-dep_url = dep.get("url") or ""
-print(f"Deployment created: {dep_id}")
-print(f"Initial URL: {dep_url}")
-
-with open("/tmp/cf_deployment.json", "w") as f:
-    json.dump({"id": dep_id, "url": dep_url}, f)
-PY
-
-          # 3) 轮询 deployment 状态
+          # 3) 轮询 deployment 状态直到 complete
           echo "等待部署完成 ..."
           DEPLOYMENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cf_deployment.json'))['id'])")
           for i in $(seq 1 30); do
@@ -238,8 +149,8 @@ PY
             if [ "$status" = "complete" ]; then
               echo "============================================"
               echo "  部署完成！访问地址:"
-              echo "  https://$url"
-              echo "  （也可能是 https://$PROJECT_NAME.pages.dev）"
+              echo "  https://$url/"
+              echo "  或 https://$PROJECT_NAME.pages.dev"
               echo "============================================"
               exit 0
             fi
@@ -255,5 +166,3 @@ PY
           PROJECT_NAME: opencad-studio
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
-# CI
