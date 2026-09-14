@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
-"""Upload local ./dist to Cloudflare Pages via the current Create-deployment API.
+"""Upload local ./dist to Cloudflare Pages via the Create-deployment API.
 
 Reads env vars: CLOUDFLARE_API_TOKEN, CF_ACCOUNT_ID, PROJECT_NAME.
 Writes /tmp/cf_deployment.json = {"id": ..., "url": ...}.
 Exit code 0 on success, 1 on any failure.
 
-Cloudflare Pages "create deployment" multipart 约定：
-- 一个普通 form-data 字段 `manifest`：值是 JSON 字符串 {"/path": "sha256hex", ...}
-- 每个唯一内容一个 form-data 字段，`name` = 该内容的 sha256hex（无 filename）
-- 字段顺序：manifest 在前，hash 字段在后（CF 要求先看到 manifest 建立映射）
+CF Pages create-deployment multipart 约定（官方文档验证过的格式）：
+- 字段 1: manifest — 普通 form-data 字段，值是 JSON 字符串 {"/path": "sha256hex"}
+- 字段 2..N: 每个唯一内容一个文件 part，name = 该内容的 sha256hex
+- 可选字段: production — 普通 form-data 字段，值 "true"
+- 关键: 不要对 body 做截断/拼接 hack，所有字段在同一个 parts 列表里顺序追加
 """
 import os, json, hashlib, urllib.request, urllib.error, uuid, sys
+
+
+def _mime_for(rel: str) -> str:
+    if rel.endswith(".html"): return "text/html; charset=utf-8"
+    if rel.endswith(".js"): return "text/javascript"
+    if rel.endswith(".wasm"): return "application/wasm"
+    if rel.endswith(".json"): return "application/json"
+    if rel.endswith(".ttf"): return "font/ttf"
+    if rel.endswith(".otf"): return "font/otf"
+    if rel.endswith(".svg"): return "image/svg+xml"
+    if rel.endswith(".css"): return "text/css"
+    return "application/octet-stream"
 
 
 def main() -> int:
@@ -24,7 +37,7 @@ def main() -> int:
         print(f"dist dir not found: {dist_dir}", file=sys.stderr)
         return 1
 
-    # 1) 扫描文件，算 SHA-256，建 manifest（URL path -> sha256）和 唯一内容集
+    # 1) 扫描文件，算 SHA-256，建 manifest（path -> hash）和 唯一内容集
     files = []
     for root, _, fnames in os.walk(dist_dir):
         for fn in fnames:
@@ -38,17 +51,18 @@ def main() -> int:
 
     manifest = {rel: h for rel, h, _ in files}
     unique = {}
+    hash2path = {}
     for rel, h, content in files:
         unique[h] = content
+        hash2path[h] = rel
     print(f"total {len(files)} files, {len(unique)} unique")
 
-    # 2) 组 multipart body。CF 要求 manifest 是普通 form-data 字段（JSON 字符串），
-    #    每个 hash 字段是文件 part（name=sha256，不带 filename 也可，CF 按 name 找）。
+    # 2) 组 multipart body — 所有字段按顺序追加到同一个 parts 列表
     boundary = "----cfpages" + uuid.uuid4().hex
     crlf = b"\r\n"
     parts = []
 
-    # manifest 字段（普通 form-data 文本，值为 JSON 字符串）
+    # 字段 1: manifest（普通 form-data 文本字段，值为 JSON 字符串）
     m_content = json.dumps(manifest).encode()
     parts.append(
         f"--{boundary}".encode() + crlf
@@ -57,24 +71,18 @@ def main() -> int:
         + m_content + crlf
     )
 
-    # 每个唯一内容一个 part（name = sha256），文件 part 带 filename + content-type
+    # 字段 2: production（让 deployment 直接上线为可访问的生产版本）
+    parts.append(
+        f"--{boundary}".encode() + crlf
+        + b'Content-Disposition: form-data; name="production"' + crlf
+        + crlf
+        + b"true" + crlf
+    )
+
+    # 字段 3..N: 每个唯一内容一个文件 part（name = sha256）
     for h, content in unique.items():
-        # 用对应路径猜 mime
-        rel = next((r for r in manifest if manifest[r] == h), "")
-        if rel.endswith(".html"):
-            mime = "text/html"
-        elif rel.endswith(".js"):
-            mime = "text/javascript"
-        elif rel.endswith(".wasm"):
-            mime = "application/wasm"
-        elif rel.endswith(".json"):
-            mime = "application/json"
-        elif rel.endswith(".ttf") or rel.endswith(".otf"):
-            mime = "font/ttf"
-        elif rel.endswith(".svg"):
-            mime = "image/svg+xml"
-        else:
-            mime = "application/octet-stream"
+        rel = hash2path.get(h, "")
+        mime = _mime_for(rel)
         parts.append(
             f"--{boundary}".encode() + crlf
             + f'Content-Disposition: form-data; name="{h}"; filename="file"'.encode() + crlf
@@ -82,22 +90,11 @@ def main() -> int:
             + content + crlf
         )
 
+    # 结束 boundary — 直接追加，不做任何截断
     body = b"".join(parts) + f"--{boundary}--".encode() + crlf
 
-    # 3) 调 create deployment（带 production=true 使其直接上线为可访问版本）
+    # 3) 调 create deployment
     url = f"{base}/accounts/{account}/pages/projects/{project}/deployments"
-    parts2 = [b"production"]
-    # 把 production 也作为普通 form-data 字段加进去（值 "true"）
-    body = body[:-len(crlf)]  # 去掉结尾的 closing boundary
-    # 重新追加 production 字段 + closing boundary
-    prod_field = (
-        f"--{boundary}".encode() + crlf
-        + b'Content-Disposition: form-data; name="production"' + crlf
-        + crlf
-        + b"true" + crlf
-    )
-    body = body + prod_field + f"--{boundary}--".encode() + crlf
-
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": f"multipart/form-data; boundary={boundary}",
