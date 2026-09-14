@@ -104,110 +104,142 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       # 9) 部署到 Cloudflare Pages
-      #    通过 CF Pages Direct Upload API（不依赖 Git 仓库绑定，直接推 ./dist 产物）。
-      #    1a) 创建/确认项目存在（POST 已存在返回 409 时视为成功）
-      #    1b) 拿一个 upload-url（POST deployments 拿到短时效的预签名 URL）
-      #    1c) 把 ./dist 打成 zip，PUT 到 upload-url
-      #    部署完成后 URL 形如 https://<project>.pages.dev，从 API 响应里取。
+      #    用 CF Pages "Create deployment" 的 multipart/form-data 直接上传接口
+      #    （现行官方 API，不依赖 Git 仓库绑定，也不需要预签名 PUT 老接口）。
+      #    1a) 创建/确认项目存在（已存在返回 409 时视为成功）
+      #    1b) 扫描 ./dist 下所有文件，算 SHA-256，组装 manifest（path → hash）
+      #    1c) multipart POST：manifest + 每个唯一 hash 一个文件 part
+      #    CF Pages 对静态资源不限单文件 25MiB（45MiB wasm 可直接推）。
       - name: Deploy to Cloudflare Pages
         run: |
           set -e
           BASE="https://api.cloudflare.com/client/v4"
           AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-          CT="Content-Type: application/json"
 
           # 1) 创建 Pages 项目（已存在时 409，忽略）
           echo "创建/确认 Cloudflare Pages 项目: $PROJECT_NAME"
-          create_resp=$(curl -s -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects" \
-            -H "$AUTH" -H "$CT" \
-            -d "{\"name\":\"$PROJECT_NAME\",\"production_branch\":\"main\"}" \
-            -w "\n%{http_code}")
-          create_code=$(echo "$create_resp" | tail -1)
-          create_body=$(echo "$create_resp" | head -n -1)
+          create_code=$(curl -s -o /tmp/cf_create.json -w "%{http_code}" \
+            -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects" \
+            -H "$AUTH" -H "Content-Type: application/json" \
+            -d "{\"name\":\"$PROJECT_NAME\",\"production_branch\":\"main\"}")
           if [ "$create_code" -eq 409 ]; then
             echo "项目已存在，跳过创建"
           elif [ "$create_code" -ge 200 ] && [ "$create_code" -lt 300 ]; then
             echo "项目创建成功"
           else
             echo "创建项目失败 (HTTP $create_code):"
-            echo "$create_body"
+            cat /tmp/cf_create.json
             exit 1
           fi
 
-          # 2) 请求 upload-url（CF 给一个短时效的预签名 PUT 地址）
-          upload_resp=$(curl -s -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments" \
-            -H "$AUTH" -H "$CT" -d "{}" -w "\n%{http_code}")
-          upload_code=$(echo "$upload_resp" | tail -1)
-          upload_body=$(echo "$upload_resp" | head -n -1)
-          if [ "$upload_code" -ne 200 ]; then
-            echo "获取 upload-url 失败 (HTTP $upload_code):"
-            echo "$upload_body"
-            exit 1
-          fi
-          UPLOAD_URL=$(echo "$upload_body" | python -c "import sys,json; print(json.load(sys.stdin)['result']['upload_url'])")
-          UPLOAD_HEADERS=$(echo "$upload_body" | python -c "
-import sys, json, shlex
-d = json.load(sys.stdin)
-for k, v in d['result'].get('upload_headers', {}).items():
-    print(f'{k}: {v}')
-" | sed 's/^/-H "/; s/$/"/' | tr '\n' ' ')
-          DEPLOYMENT_ID=$(echo "$upload_body" | python -c "import sys,json; print(json.load(sys.stdin)['result']['id'])")
-          echo "Deployment: $DEPLOYMENT_ID"
-
-          # 3) 把 ./dist 打成 zip 并 PUT 到 upload-url
-          echo "打包 ./dist → site.zip"
-          cd dist
-          # 用 Python 的 zipfile 模块（比 curl 的 --data-binary 更稳，自动加 Content-Length）
+          # 2) 生成 multipart 上传请求（manifest + 文件 parts）
+          echo "扫描 ./dist 并准备 multipart 上传 ..."
           python3 - <<'PY'
-import zipfile, os
-with zipfile.ZipFile('site.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
-    for root, dirs, files in os.walk('.'):
-        for f in files:
-            p = os.path.join(root, f)
-            arc = p[2:]  # 去掉开头 ./
-            zf.write(p, arcname=arc)
-            print('  +', arc, os.path.getsize(p))
-print('site.zip 已生成')
+import os, json, hashlib, mimetypes, urllib.request, urllib.error, uuid, sys
+
+base = "https://api.cloudflare.com/client/v4"
+token = os.environ["CLOUDFLARE_API_TOKEN"]
+account = os.environ["CF_ACCOUNT_ID"]
+project = os.environ["PROJECT_NAME"]
+dist_dir = "dist"
+
+# 2a) 扫描所有文件，算 SHA-256，建 manifest + 唯一文件集合
+files = []
+for root, _, fnames in os.walk(dist_dir):
+    for fn in fnames:
+        p = os.path.join(root, fn)
+        rel = "/" + os.path.relpath(p, dist_dir)  # 以 / 开头
+        with open(p, "rb") as f:
+            content = f.read()
+        h = hashlib.sha256(content).hexdigest()
+        files.append((rel, h, content))
+        print(f"  {rel}  ({len(content)} bytes, sha256={h[:12]}…)")
+
+manifest = {rel: h for rel, h, _ in files}
+unique = {}  # hash -> content
+for rel, h, content in files:
+    unique[h] = content
+
+print(f"共 {len(files)} 个文件，唯一 {len(unique)} 个")
+
+# 2b) 组 multipart body
+boundary = "----cfpages" + uuid.uuid4().hex
+crlf = b"\r\n"
+parts = []
+
+# manifest part（JSON）
+m_content = json.dumps(manifest).encode()
+parts.append(
+    f"--{boundary}".encode()
+    + crlf
+    + b'Content-Disposition: form-data; name="manifest"' + crlf
+    + b"Content-Type: application/json" + crlf + crlf
+    + m_content + crlf
+)
+
+# 每个唯一文件 part（part name = SHA-256 hash）
+for h, content in unique.items():
+    mime = mimetypes.guess_type(h + ".bin")[0] or "application/octet-stream"
+    # 用真实扩展名猜更准
+    for rel in manifest:
+        if manifest[rel] == h:
+            mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+            break
+    parts.append(
+        f"--{boundary}".encode()
+        + crlf
+        + f"Content-Disposition: form-data; name=\"{h}\"; filename=\"file\"".encode()
+        + crlf
+        + f"Content-Type: {mime}".encode() + crlf + crlf
+        + content + crlf
+    )
+
+body = b"".join(parts) + f"--{boundary}--".encode() + crlf
+
+# 2c) 调 create deployment
+url = f"{base}/accounts/{account}/pages/projects/{project}/deployments"
+req = urllib.request.Request(url, data=body, method="POST", headers={
+    "Authorization": f"Bearer {token}",
+    "Content-Type": f"multipart/form-data; boundary={boundary}",
+})
+try:
+    with urllib.request.urlopen(req, timeout=600) as r:
+        resp = json.load(r)
+except urllib.error.HTTPError as e:
+    err = e.read().decode("utf-8", "replace")
+    print(f"Create deployment failed (HTTP {e.code}):")
+    print(err[:3000])
+    sys.exit(1)
+
+if not resp.get("success"):
+    print("API returned success=false:")
+    print(json.dumps(resp.get("errors", resp), indent=2)[:3000])
+    sys.exit(1)
+
+dep = resp["result"]
+dep_id = dep.get("id")
+dep_url = dep.get("url") or ""
+print(f"Deployment created: {dep_id}")
+print(f"Initial URL: {dep_url}")
+
+with open("/tmp/cf_deployment.json", "w") as f:
+    json.dump({"id": dep_id, "url": dep_url}, f)
 PY
-          cd -
-          zip_size=$(stat -c%s dist/site.zip 2>/dev/null || stat -f%z dist/site.zip)
-          echo "site.zip 大小: $zip_size bytes"
 
-          # 4) PUT 到 upload-url（带上 CF 给的 Content-Length 等 headers）
-          echo "PUT 到 Cloudflare ..."
-          put_resp=$(curl -s -X PUT "$UPLOAD_URL" \
-            $(echo "$upload_body" | python -c "
-import sys, json, shlex
-d = json.load(sys.stdin)
-for k, v in d['result'].get('upload_headers', {}).items():
-    print(shlex.quote(f'{k}: {v}'))
-" 2>/dev/null | xargs -I{} echo -n "-H {} ") \
-            -H "Content-Type: application/zip" \
-            --data-binary @dist/site.zip \
-            -w "\n%{http_code}")
-          put_code=$(echo "$put_resp" | tail -1)
-          put_body=$(echo "$put_resp" | head -n -1)
-          if [ "$put_code" -ge 200 ] && [ "$put_code" -lt 300 ]; then
-            echo "上传成功"
-          else
-            echo "上传失败 (HTTP $put_code):"
-            echo "$put_body"
-            exit 1
-          fi
-
-          # 5) 轮询 deployment 状态
+          # 3) 轮询 deployment 状态
           echo "等待部署完成 ..."
+          DEPLOYMENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cf_deployment.json'))['id'])")
           for i in $(seq 1 30); do
             sleep 10
             dep=$(curl -s "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments/$DEPLOYMENT_ID" -H "$AUTH")
-            status=$(echo "$dep" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('status',''))")
-            url=$(echo "$dep" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('url',''))")
+            status=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('status','unknown'))")
+            url=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('url','') or '')")
             echo "  [$i/30] status=$status url=$url"
             if [ "$status" = "complete" ]; then
               echo "============================================"
               echo "  部署完成！访问地址:"
               echo "  https://$url"
-              echo "  （URL 也可能是 $PROJECT_NAME.pages.dev）"
+              echo "  （也可能是 https://$PROJECT_NAME.pages.dev）"
               echo "============================================"
               exit 0
             fi
