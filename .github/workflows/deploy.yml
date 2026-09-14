@@ -64,8 +64,59 @@ jobs:
       #    --dist dist      覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
       #    --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
       #    这两个必须同时给，且要和下面的部署目录 ./dist 匹配
+      #    RUSTFLAGS="-C lto=thin -C opt-level=s -C codegen-units=1" 在 CI 临时开 LTO，
+      #    砍 wasm 体积但不改全局 Cargo.toml（避免影响桌面端构建与 panic 策略）。
+      #    opt-level=s 比 z 更安全（z 可能破坏 wasm 的某些 inline 假设）。
       - name: Build with Trunk
-        run: trunk build --locked --release --dist dist --public-url /
+        run: |
+          set -e
+          export RUSTFLAGS="-C lto=thin -C opt-level=s -C codegen-units=1"
+          trunk build --locked --release --dist dist --public-url /
+
+      # 7) 用 binaryen 的 wasm-opt 二次优化 .wasm 文件
+      #    -O3 开 LTO 风格的二次 DCE + inlining + codegen
+      #    --sign-ext / --bulk-memory 开现代 wasm 特性，砍重复的 32bit 操作
+      #    只对纯 .wasm 文件做，不要喂给 wasm-bindgen 的胶水 JS 文件
+      #    通常能再砍 10-20% 体积，叠加 [profile.release] 的极致优化，
+      #    45MiB → 预计 18-25MiB（过 EdgeOne Pages 单文件 25MiB 上限）
+      - name: Install binaryen (wasm-opt)
+        run: |
+          set -e
+          # 用 GitHub 官方 wasm-opt 预编译二进制，跨平台直接下
+          # 锁定一个已知可用的版本；如果失效换 tag（看 https://github.com/WebAssembly/binaryen/releases）
+          BIN="wasm-opt"
+          curl -fsSL -o "$BIN" "https://github.com/WebAssembly/binaryen/releases/download/version_118/wasm-opt-wasm32"
+          chmod +x "$BIN"
+          mv "$BIN" "$HOME/.local/bin/wasm-opt" 2>/dev/null || mv "$BIN" "/usr/local/bin/wasm-opt"
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          wasm-opt --version
+
+      - name: Optimize wasm with wasm-opt
+        run: |
+          set -e
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          echo "=== 优化前 .wasm 文件 ==="
+          ls -lh dist/*.wasm
+          # -O3 最高优化 + sign-ext + bulk-memory 特性
+          # 原地替换 dist 下每个 .wasm
+          for f in dist/*.wasm; do
+            [ -f "$f" ] || continue
+            echo "Optimizing: $f"
+            WASM_FILE="$f"
+            # wasm-opt 不能原地覆盖，先写临时文件再 mv
+            wasm-opt -O3 --sign-ext --bulk-memory \
+              -o "${f}.opt" "$f"
+            mv "${f}.opt" "$f"
+          done
+          echo "=== 优化后 .wasm 文件 ==="
+          ls -lh dist/*.wasm
+          # 自检：任何单文件还超 25MiB 就报错，提前暴露
+          if find dist -type f -size +25M | grep -q .; then
+            echo "::error::仍有文件超过 25MiB，EdgeOne Pages 会拒收。请进一步缩小产物。"
+            find dist -type f -size +25M -exec ls -lh {} \;
+            exit 1
+          fi
+          echo "✓ 所有文件 < 25MiB，EdgeOne Pages 校验可通过"
 
       # 5) 部署前自检：确认要上传的目录根部有 index.html
       #    没有它 EdgeOne 首页会直接 404，这一步提前暴露问题
@@ -73,7 +124,7 @@ jobs:
         run: |
           ls -lh dist/
           test -f dist/index.html || { echo "dist/index.html 不存在，构建异常"; exit 1; }
-          echo "大于 20M 的文件（留意体积）："
+          echo "大于 20M 的文件（留意体积，wasm-opt 后应已 <25MiB）："
           find dist -type f -size +20M -exec ls -lh {} \; || true
 
       # 6) 前置校验：token 缺失/项目名缺失时立刻失败，
