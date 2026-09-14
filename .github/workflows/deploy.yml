@@ -113,60 +113,11 @@ jobs:
       - name: Deploy to Cloudflare Pages
         run: |
           set -e
-          BASE="https://api.cloudflare.com/client/v4"
-          AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-
-          # 1) 创建/确认 Pages 项目（已存在返回 409，忽略）
-          echo "创建/确认 Cloudflare Pages 项目: $PROJECT_NAME"
-          create_code=$(curl -s -o /tmp/cf_create.json -w "%{http_code}" \
-            -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects" \
-            -H "$AUTH" -H "Content-Type: application/json" \
-            -d "{\"name\":\"$PROJECT_NAME\",\"production_branch\":\"main\"}")
-          if [ "$create_code" -eq 409 ]; then
-            echo "项目已存在，跳过创建"
-          elif [ "$create_code" -ge 200 ] && [ "$create_code" -lt 300 ]; then
-            echo "项目创建成功"
-          else
-            echo "创建项目失败 (HTTP $create_code):"
-            cat /tmp/cf_create.json
-            exit 1
-          fi
-
-          # 2) 上传 dist 并创建 deployment（脚本独立存放在 .github/cf_deploy.py，
-          #    避免把整段 Python 嵌进 YAML run: 块导致 column-0 heredoc 解析失败）
-          echo "上传 ./dist 并创建 deployment ..."
-          python3 .github/cf_deploy.py
-
-          # 3) 轮询 deployment 状态直到 complete
-          #    注意：CF 刚创建时 result.status 常为 null（读出来是 'unknown'），要持续等待；
-          #    只有 status=failed 才判失败，其他任何值（unknown/pending/initializing/...）都继续轮询。
-          echo "等待部署完成 ..."
-          DEPLOYMENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cf_deployment.json'))['id'])")
-          for i in $(seq 1 40); do
-            sleep 15
-            dep=$(curl -s "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments/$DEPLOYMENT_ID" -H "$AUTH")
-            status=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); s=(d.get('result') or {}).get('status'); print(s if s else 'unknown')")
-            url=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('url','') or '')")
-            echo "  [$i/40] status=$status url=$url"
-            if [ "$status" = "complete" ]; then
-              echo "============================================"
-              echo "  部署完成！访问地址:"
-              echo "  https://$url"
-              echo "  或 https://$PROJECT_NAME.pages.dev"
-              echo "============================================"
-              exit 0
-            fi
-            if [ "$status" = "failed" ]; then
-              echo "部署失败，详情:"
-              echo "$dep"
-              exit 1
-            fi
-          done
-          # 超时但仍未判失败：deployment 大概率已上线（页面可访问），给提示但不报错
-          echo "轮询 10 分钟未拿到 complete，但部署请求已成功提交；请到 CF 控制台查看 opencad-studio。"
-          echo "站点地址: https://$PROJECT_NAME.pages.dev （preview: https://$DEPLOYMENT_ID.opencad-studio.pages.dev）"
-          exit 0
+          npx wrangler@latest pages deploy dist --project-name=$PROJECT_NAME --branch=main --commit-dirty=false
+          echo "============================================"
+          echo "  部署完成！访问地址:"
+          echo "  https://$PROJECT_NAME.pages.dev"
+          echo "============================================"
         env:
           PROJECT_NAME: opencad-studio
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
