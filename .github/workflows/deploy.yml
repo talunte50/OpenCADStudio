@@ -69,6 +69,13 @@ jobs:
         run: |
           set -e
           trunk build --locked --release --dist dist --public-url /
+          # Trunk 的 html_output = index.html 产物是未注入 JS 的空壳页面，
+          # 真正注入 wasm/JS 的是入口模板 web-app.html。
+          # 把 web-app.html 覆盖成 index.html，让 CF Pages 根路径拿到可运行的页面。
+          if [ -f dist/web-app.html ]; then
+            cp dist/web-app.html dist/index.html
+            echo '已将 dist/web-app.html 覆盖为 dist/index.html'
+          fi
 
       # 7) 部署前自检：确认要上传的目录根部有 index.html
       #    没有它 CF Pages 首页会直接 404，这一步提前暴露问题
