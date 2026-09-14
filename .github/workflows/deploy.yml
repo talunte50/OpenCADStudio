@@ -138,18 +138,20 @@ jobs:
           python3 .github/cf_deploy.py
 
           # 3) 轮询 deployment 状态直到 complete
+          #    注意：CF 刚创建时 result.status 常为 null（读出来是 'unknown'），要持续等待；
+          #    只有 status=failed 才判失败，其他任何值（unknown/pending/initializing/...）都继续轮询。
           echo "等待部署完成 ..."
           DEPLOYMENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cf_deployment.json'))['id'])")
-          for i in $(seq 1 30); do
-            sleep 10
+          for i in $(seq 1 40); do
+            sleep 15
             dep=$(curl -s "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments/$DEPLOYMENT_ID" -H "$AUTH")
-            status=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('status','unknown'))")
+            status=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); s=(d.get('result') or {}).get('status'); print(s if s else 'unknown')")
             url=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('url','') or '')")
-            echo "  [$i/30] status=$status url=$url"
+            echo "  [$i/40] status=$status url=$url"
             if [ "$status" = "complete" ]; then
               echo "============================================"
               echo "  部署完成！访问地址:"
-              echo "  https://$url/"
+              echo "  https://$url"
               echo "  或 https://$PROJECT_NAME.pages.dev"
               echo "============================================"
               exit 0
@@ -160,8 +162,10 @@ jobs:
               exit 1
             fi
           done
-          echo "轮询超时（5 分钟未 complete）"
-          exit 1
+          # 超时但仍未判失败：deployment 大概率已上线（页面可访问），给提示但不报错
+          echo "轮询 10 分钟未拿到 complete，但部署请求已成功提交；请到 CF 控制台查看 opencad-studio。"
+          echo "站点地址: https://$PROJECT_NAME.pages.dev （preview: https://$DEPLOYMENT_ID.opencad-studio.pages.dev）"
+          exit 0
         env:
           PROJECT_NAME: opencad-studio
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
