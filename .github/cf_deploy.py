@@ -39,11 +39,15 @@ def main() -> int:
         hash2path[h] = rel
     print(f"total {len(files)} files, {len(unique)} unique")
 
-    # 2) 组 multipart body: manifest part + 每个唯一 hash 一个文件 part
+    # 2) 组 multipart body:
+    #    CF Pages "create deployment" 要求在 multipart 里放一个 `manifest` 字段
+    #    （JSON 字符串：URL path -> 内容 SHA-256），CF 凭它把每个 URL 映射到对应
+    #    文件哈希；漏掉会导致所有路径回源 500。
     boundary = "----cfpages" + uuid.uuid4().hex
     crlf = b"\r\n"
     parts = []
 
+    # manifest 字段
     m_content = json.dumps(manifest).encode()
     parts.append(
         f"--{boundary}".encode()
@@ -53,6 +57,7 @@ def main() -> int:
         + m_content + crlf
     )
 
+    # 每个唯一文件 part（part name = 内容 SHA-256 哈希）
     for h, content in unique.items():
         rel = hash2path.get(h, "")
         mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
