@@ -17,6 +17,14 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # 项目名 + 加速区域。
+      # 区域必须是 overseas（= 全球可用区(不含中国大陆)）：
+      #   - global（含中国大陆）下，免费域名只能用带 eo_token/eo_time 的预览链接访问，
+      #     3 小时就过期，超时返回 401；
+      #   - overseas 下，非中国大陆网络可直连，且绑定自定义域名无需工信部备案。
+      PROJECT_NAME: opencad-studio
+      AREA: overseas
     steps:
       # ================= 1. 构建 =================
       - name: Checkout repository
@@ -58,7 +66,6 @@ jobs:
 
       # --dist dist     覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
       # --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
-      # 注意：这里不再传 --locked（trunk 的 --locked 不稳定），Cargo.lock 仍然生效
       - name: Build with Trunk
         run: |
           set -e
@@ -70,7 +77,7 @@ jobs:
       # 上游产物 OpenCADStudio-<hash>_bg.wasm 约 45.3MiB，
       # 而 EdgeOne Pages（以及 Cloudflare Pages）单文件上限都是 25MB，
       # 45MiB 直接推会失败 —— 这是本站点 500 / 部署失败的最终根因。
-      # 解法：brotli 预压缩成 ~12MiB，再把 .br 改名回 .wasm（保持引用路径不变），
+      # 解法：brotli 预压缩成 ~9.4MiB，再把 .br 改名回 .wasm（保持引用路径不变），
       #       最后由 edgeone.json 声明 Content-Encoding: br，浏览器自动解压。
       - name: Brotli-compress wasm
         run: |
@@ -121,9 +128,8 @@ jobs:
             exit 1
           fi
           echo "EdgeOne Token 已设置，长度: ${#EDGEONE_API_TOKEN}"
-          echo "项目名: $PROJECT_NAME"
+          echo "项目名: $PROJECT_NAME / 加速区域: $AREA"
         env:
-          PROJECT_NAME: opencad-studio
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
 
       - name: Setup Node.js
@@ -134,8 +140,9 @@ jobs:
       # EdgeOne CLI v1.6+ 的命令是 `edgeone makers deploy`；
       # 旧文档里的 `edgeone pages deploy` 作为回退再试一次。
       - name: Deploy to EdgeOne Pages
+        id: deploy
         run: |
-          set -e
+          set -eo pipefail
           npm install -g edgeone@1.6.39
           edgeone --version
 
@@ -143,19 +150,89 @@ jobs:
           edgeone makers deploy --help || true
           echo "--------------------------------------------------"
 
-          if edgeone makers deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production; then
+          if edgeone makers deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production -a "$AREA" 2>&1 | tee /tmp/eo_deploy.log; then
             echo "部署完成（makers deploy）"
           else
             echo "::warning::makers deploy 失败，回退尝试旧命令 pages deploy ..."
-            edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production
+            edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production -a "$AREA" 2>&1 | tee /tmp/eo_deploy.log
             echo "部署完成（pages deploy）"
           fi
 
+          echo "---------- 部署日志要点 ----------"
+          grep -aiE 'area|Deploy URL|Project ID|Deploy Success' /tmp/eo_deploy.log || true
+
+          URL=$(grep -aoE 'https://[A-Za-z0-9._-]+\.edgeone\.(cool|app|site)' /tmp/eo_deploy.log | head -1 || true)
+          echo "deploy_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "解析到部署地址: $URL"
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+
+      # ================= 4. 端到端校验（关键）=================
+      # runner 在美国 = 非中国大陆网络。区域为 overseas 时，免费域名可直连；
+      # 区域为 global 时会回 401（免费域名只能用带 eo_token/eo_time 的 3 小时预览链接）。
+      - name: Verify deployed site end-to-end
+        run: |
+          set -eo pipefail
+          URL="${{ steps.deploy.outputs.deploy_url }}"
+          if [ -z "$URL" ]; then
+            echo "::error::没能从部署日志里解析出部署地址，无法校验"
+            exit 1
+          fi
+          BASE="${URL%/}"
+          echo "校验目标: $BASE"
+
+          echo "===== 1) 首页 ====="
+          code=$(curl -s -o /tmp/idx.html -w '%{http_code}' -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' "$BASE/")
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::首页返回 $code，期望 200。"
+            head -c 500 /tmp/idx.html || true
+            echo
+            exit 1
+          fi
+          head -c 300 /tmp/idx.html; echo
+
+          echo "===== 2) 定位 js / wasm ====="
+          JS=$(grep -aoE '/[A-Za-z0-9._-]+\.js' /tmp/idx.html | head -1 || true)
+          echo "js = $JS"
+          if [ -z "$JS" ]; then
+            echo "::error::index.html 里找不到 js 引用"
+            exit 1
+          fi
+          WASM="${JS%.js}_bg.wasm"
+          echo "wasm = $WASM"
+
+          echo "===== 3) wasm 响应头 ====="
+          curl -sI -A 'Mozilla/5.0' "$BASE$WASM" | sed -n '1,25p'
+
+          echo "===== 4) 实际下载并用 curl 解压 ====="
+          curl -s --compressed -A 'Mozilla/5.0' "$BASE$WASM" -o /tmp/app.wasm -w 'http=%{http_code} size_download=%{size_download}\n'
+          ls -l /tmp/app.wasm
+          magic=$(od -An -t x1 -N4 /tmp/app.wasm | tr -d ' \n')
+          echo "前 4 字节 = $magic  （期望 0061736d，即 \\0asm 魔数）"
+          if [ "$magic" != "0061736d" ]; then
+            echo "::error::wasm 解压后不是合法的 WebAssembly（前 4 字节 $magic）。Content-Encoding 链路有问题。"
+            exit 1
+          fi
+
+          echo "===== 5) worker wasm ====="
+          curl -sI -A 'Mozilla/5.0' "$BASE/worker_pkg/ocs_web_worker_bg.wasm" | sed -n '1,20p'
+          curl -s --compressed -A 'Mozilla/5.0' "$BASE/worker_pkg/ocs_web_worker_bg.wasm" -o /tmp/worker.wasm -w 'http=%{http_code} size_download=%{size_download}\n'
+          wmagic=$(od -An -t x1 -N4 /tmp/worker.wasm | tr -d ' \n')
+          echo "worker 前 4 字节 = $wmagic"
+          if [ "$wmagic" != "0061736d" ]; then
+            echo "::error::worker wasm 解压后不是合法的 WebAssembly"
+            exit 1
+          fi
+
+          echo "===== 6) 其它静态资源抽查 ====="
+          for p in "/${JS#/}" "/index.html" "/robots.txt"; do
+            c=$(curl -s -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' "$BASE$p" || true)
+            echo "  $p -> $c"
+          done
+
           echo "============================================"
-          echo "  EdgeOne 部署已提交"
-          echo "  项目名: $PROJECT_NAME"
+          echo "  校验通过：站点可访问，wasm 解压后为合法 WebAssembly"
+          echo "  站点地址: $BASE"
           echo "  自定义域名: https://cad.nxzai.cc.cd"
           echo "============================================"
-        env:
-          PROJECT_NAME: opencad-studio
-          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
