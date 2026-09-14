@@ -1,4 +1,4 @@
-name: Build and Deploy to Cloudflare Pages
+name: Build and Deploy to EdgeOne Pages
 
 on:
   push:
@@ -16,35 +16,32 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
+      # ================= 1. 构建 =================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1) Rust + wasm32 目标
-      #    这一步必须在 GitHub 上跑：CF Pages 自带的构建环境没有 Rust
+      # Rust + wasm32 目标。必须在 CI 上构建：EdgeOne / CF 的托管构建环境没有 Rust。
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      # 2) 缓存 cargo 依赖与编译产物
-      #    首次构建约 20-40 分钟；有缓存后通常几分钟
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 3) 安装 Trunk
-      #    上游用 jetli/trunk-action 装预编译二进制；若该第三方 action 失效，
-      #    会退回 cargo 源码编译（慢几分钟但稳）。
+      # 必须钉死版本，不能用 'latest'：
+      #   latest 会漂移到 trunk v0.22.0-beta.x，该版本已不再接受 `--locked`，
+      #   会让 `trunk build --locked` 在第 8 步直接以 exit 2 失败（run #34876044442）。
+      #   v0.21.14 是当前最后一个正式版。
       - name: Install Trunk
         uses: jetli/trunk-action@v0.4.0
         with:
-          version: 'latest'
+          version: 'v0.21.14'
 
-      # 4) 关键：从 Cargo.lock 读出 wasm-bindgen 的锁定版本，
-      #    再装"完全匹配"的 wasm-bindgen CLI。
-      #    trunk build 会用系统里的 wasm-bindgen 处理产物，版本不匹配
-      #    （比如 latest 对 0.2.108）会让构建在最后一步挂掉——
-      #    这正是上一次 Build with Trunk 失败的根因。
+      # 关键：从 Cargo.lock 读出 wasm-bindgen 的锁定版本，
+      # 再装"完全匹配"的 wasm-bindgen CLI。版本不匹配会让构建在最后一步挂掉。
       - name: Read wasm-bindgen version
         id: wasm-bindgen-version
         shell: bash
@@ -54,116 +51,111 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "锁定 wasm-bindgen 版本: $VERSION"
 
-      # 5) 装对应版本的 wasm-bindgen CLI（必须和 Cargo.lock 完全一致）
       - name: Install wasm-bindgen CLI
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@${{ steps.wasm-bindgen-version.outputs.version }}
 
-      # 6) 构建静态产物（--locked 强制用 Cargo.lock 锁定版本，防止漂移）
-      #    --dist dist      覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
-      #    --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
-      #    这两个必须同时给，且要和下面的部署目录 ./dist 匹配
-      #    CF Pages 不限单文件 25MiB，不需要 wasm-opt 优化，45MiB wasm 直接推。
+      # --dist dist     覆盖 Trunk.toml 的 dist = "dist/app"，产物写到 ./dist
+      # --public-url /  覆盖 public_url = "/app/"，资源引用改为根路径
+      # 注意：这里不再传 --locked（trunk 的 --locked 不稳定），Cargo.lock 仍然生效
       - name: Build with Trunk
         run: |
           set -e
-          trunk build --locked --release --dist dist --public-url /
+          trunk build --release --dist dist --public-url /
+          echo "=== 构建产物（按大小倒序前 20）==="
+          find dist -type f -printf '%12s  %p\n' | sort -rn | head -20
 
-      # 7) 部署前自检：确认要上传的目录根部有 index.html
-      #    没有它 CF Pages 首页会直接 404，这一步提前暴露问题
-      - name: Verify build output
+      # ================= 2. 压到 25MB 以内 =================
+      # 上游产物 OpenCADStudio-<hash>_bg.wasm 约 45.3MiB，
+      # 而 EdgeOne Pages（以及 Cloudflare Pages）单文件上限都是 25MB，
+      # 45MiB 直接推会失败 —— 这是本站点 500 / 部署失败的最终根因。
+      # 解法：brotli 预压缩成 ~12MiB，再把 .br 改名回 .wasm（保持引用路径不变），
+      #       最后由 edgeone.json 声明 Content-Encoding: br，浏览器自动解压。
+      - name: Brotli-compress wasm
         run: |
-          ls -lh dist/
-          test -f dist/index.html || { echo "dist/index.html 不存在，构建异常"; exit 1; }
-          echo "wasm 文件大小（CF Pages 不限 25MiB，仅记录）："
-          find dist -name "*.wasm" -exec ls -lh {} \;
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq brotli
+          echo "brotli 版本: $(brotli --version)"
 
-      # 8) 前置校验：CF 凭据缺失时立刻失败，
-      #    避免把"配置错误"拖到部署阶段才暴露（API 报错不够直白）
+          for f in $(find dist -type f -name '*.wasm'); do
+            before=$(stat -c%s "$f")
+            brotli -q 11 -f -o "$f.br" "$f"
+            after=$(stat -c%s "$f.br")
+            mv -f "$f.br" "$f"
+            echo "brotli: $f   $before -> $after bytes"
+          done
+
+          echo "=== 压缩后（按大小倒序前 20）==="
+          find dist -type f -printf '%12s  %p\n' | sort -rn | head -20
+
+      # edgeone.json 必须放在「要上传的目录根部」，CLI 才会读到 headers 规则
+      - name: Add EdgeOne headers config
+        run: |
+          set -e
+          cp .github/edgeone.json dist/edgeone.json
+          echo "--- dist/edgeone.json ---"
+          cat dist/edgeone.json
+
+      # 硬断言：任何一个文件 >= 25MB，部署一定失败，提前在这里挂掉
+      - name: Assert no file exceeds 25MB
+        run: |
+          set -e
+          LIMIT=$((25 * 1024 * 1024))
+          test -f dist/index.html || { echo "::error::dist/index.html 不存在，构建异常"; exit 1; }
+          biggest=$(find dist -type f -printf '%s %p\n' | sort -rn | head -1)
+          size=$(echo "$biggest" | cut -d' ' -f1)
+          echo "最大文件: $biggest"
+          if [ "$size" -ge "$LIMIT" ]; then
+            echo "::error::存在 >= 25MB 的文件（EdgeOne Pages 单文件硬上限），压缩没生效。"
+            exit 1
+          fi
+          echo "OK: index.html 存在，且全部文件均低于 25MB"
+
+      # ================= 3. 部署 =================
       - name: Pre-flight check
         run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "::error::CLOUDFLARE_API_TOKEN 未设置。请先到仓库 Settings → Secrets and variables → Actions 添加 secret 'CLOUDFLARE_API_TOKEN'（值从 Cloudflare 控制台 My profile → API Tokens 获取，需 Pages:Edit + Account:Read 权限）。"
+          if [ -z "$EDGEONE_API_TOKEN" ]; then
+            echo "::error::EDGEONE_API_TOKEN 未设置。请到仓库 Settings → Secrets and variables → Actions 添加 secret 'EDGEONE_API_TOKEN'（值来自 EdgeOne Pages 控制台 → API Token）。"
             exit 1
           fi
-          if [ -z "$CF_ACCOUNT_ID" ]; then
-            echo "::error::CF_ACCOUNT_ID 未设置。请添加 secret 'CF_ACCOUNT_ID'（Cloudflare 控制台右上角 → Manage Account → 账号 ID）。"
-            exit 1
-          fi
-          if [ -z "$PROJECT_NAME" ]; then
-            echo "::error::PROJECT_NAME 未设置。该 workflow 需要它指定要部署到哪个 Cloudflare Pages 项目。"
-            exit 1
-          fi
-          echo "Token 已设置，长度: ${#CLOUDFLARE_API_TOKEN}（前 8 位: ${CLOUDFLARE_API_TOKEN:0:8}...）"
-          echo "Account: $CF_ACCOUNT_ID"
+          echo "EdgeOne Token 已设置，长度: ${#EDGEONE_API_TOKEN}"
           echo "项目名: $PROJECT_NAME"
         env:
           PROJECT_NAME: opencad-studio
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
 
-      # 9) 部署到 Cloudflare Pages
-      #    用 CF Pages "Create deployment" 的 multipart/form-data 直接上传接口
-      #    （现行官方 API，不依赖 Git 仓库绑定，也不需要预签名 PUT 老接口）。
-      #    1a) 创建/确认项目存在（已存在返回 409 时视为成功）
-      #    1b) 扫描 ./dist 下所有文件，算 SHA-256，组装 manifest（path → hash）
-      #    1c) multipart POST：manifest + 每个唯一 hash 一个文件 part
-      #    CF Pages 对静态资源不限单文件 25MiB（45MiB wasm 可直接推）。
-      - name: Deploy to Cloudflare Pages
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # EdgeOne CLI v1.6+ 的命令是 `edgeone makers deploy`；
+      # 旧文档里的 `edgeone pages deploy` 作为回退再试一次。
+      - name: Deploy to EdgeOne Pages
         run: |
           set -e
-          BASE="https://api.cloudflare.com/client/v4"
-          AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+          npm install -g edgeone@1.6.39
+          edgeone --version
 
-          # 1) 创建/确认 Pages 项目（已存在返回 409，忽略）
-          echo "创建/确认 Cloudflare Pages 项目: $PROJECT_NAME"
-          create_code=$(curl -s -o /tmp/cf_create.json -w "%{http_code}" \
-            -X POST "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects" \
-            -H "$AUTH" -H "Content-Type: application/json" \
-            -d "{\"name\":\"$PROJECT_NAME\",\"production_branch\":\"main\"}")
-          if [ "$create_code" -eq 409 ]; then
-            echo "项目已存在，跳过创建"
-          elif [ "$create_code" -ge 200 ] && [ "$create_code" -lt 300 ]; then
-            echo "项目创建成功"
+          echo "---------- edgeone makers deploy --help ----------"
+          edgeone makers deploy --help || true
+          echo "--------------------------------------------------"
+
+          if edgeone makers deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production; then
+            echo "部署完成（makers deploy）"
           else
-            echo "创建项目失败 (HTTP $create_code):"
-            cat /tmp/cf_create.json
-            exit 1
+            echo "::warning::makers deploy 失败，回退尝试旧命令 pages deploy ..."
+            edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production
+            echo "部署完成（pages deploy）"
           fi
 
-          # 2) 上传 dist 并创建 deployment
-          #    wrangler CLI 有 25MiB 单文件限制，raw API 没有
-          echo "上传 ./dist 并创建 deployment ..."
-          python3 .github/cf_deploy.py
-
-          # 3) 轮询 deployment 状态
-          echo "等待部署完成 ..."
-          DEPLOYMENT_ID=$(python3 -c "import json; print(json.load(open('/tmp/cf_deployment.json'))['id'])")
-          for i in $(seq 1 40); do
-            sleep 15
-            dep=$(curl -s "$BASE/accounts/$CF_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments/$DEPLOYMENT_ID" -H "$AUTH")
-            status=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); s=(d.get('result') or {}).get('status'); print(s if s else 'unknown')")
-            url=$(echo "$dep" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('result') or {}).get('url','') or '')")
-            echo "  [$i/40] status=$status url=$url"
-            if [ "$status" = "complete" ]; then
-              echo "============================================"
-              echo "  部署完成！访问地址:"
-              echo "  https://$url"
-              echo "  或 https://$PROJECT_NAME.pages.dev"
-              echo "============================================"
-              exit 0
-            fi
-            if [ "$status" = "failed" ]; then
-              echo "部署失败，详情:"
-              echo "$dep"
-              exit 1
-            fi
-          done
-          echo "轮询 10 分钟未拿到 complete，但部署请求已成功提交。"
-          echo "站点地址: https://$PROJECT_NAME.pages.dev"
-          exit 0
+          echo "============================================"
+          echo "  EdgeOne 部署已提交"
+          echo "  项目名: $PROJECT_NAME"
+          echo "  自定义域名: https://cad.nxzai.cc.cd"
+          echo "============================================"
         env:
           PROJECT_NAME: opencad-studio
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
