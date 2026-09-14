@@ -161,12 +161,14 @@ jobs:
       #    使用控制台已建好的项目名（PROJECT_NAME）。CLI 会推送 ./dist 到该项目。
       #    部署完成后 CLI 会打印 production URL（形如 https://xxx.edgeone.app），
       #    从日志里可以直接拿到访问地址。
+      #    --area overseas  指定"全球可用区（不含中国大陆）"加速区域。
+      #    （global = 全球 + 中国大陆；overseas = 不含中国大陆）
       - name: Deploy to EdgeOne Pages
         run: |
           set -e
           export PATH="$(npm config get prefix)/bin:$PATH"
-          echo "开始部署到 EdgeOne Pages 项目: $PROJECT_NAME"
-          edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN"
+          echo "开始部署到 EdgeOne Pages 项目: $PROJECT_NAME (area=overseas)"
+          edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" --area overseas
           echo "部署完成。访问地址（从上方日志的 production URL 行获取）："
         env:
           PROJECT_NAME: opencad-studio
