@@ -59,11 +59,47 @@ jobs:
           echo "大于 20M 的文件（留意体积）："
           find dist -type f -size +20M -exec ls -lh {} \; || true
 
-      # 6) 部署到 EdgeOne Pages
-      #    项目不存在会按 PROJECT_NAME 自动创建
-      #    部署后的 URL 会打印在这一步的输出日志里
+      # 6) 前置校验：token 缺失/项目名缺失时立刻失败，
+      #    避免把"配置错误"拖到 CLI 部署阶段才暴露（CLI 的报错不够直白）
+      - name: Pre-flight check
+        run: |
+          if [ -z "$EDGEONE_API_TOKEN" ]; then
+            echo "::error::EDGEONE_API_TOKEN 未设置。请先到仓库 Settings → Secrets and variables → Actions 添加 secret 'EDGEONE_API_TOKEN'（值从 EdgeOne 控制台 Pages → 项目设置 → API Token 获取）。"
+            exit 1
+          fi
+          if [ -z "$PROJECT_NAME" ]; then
+            echo "::error::PROJECT_NAME 未设置。该 workflow 需要它指定要部署到哪个 EdgeOne Pages 项目。"
+            exit 1
+          fi
+          echo "Token 已设置，长度: ${#EDGEONE_API_TOKEN}（前 8 位: ${EDGEONE_API_TOKEN:0:8}...）"
+          echo "项目名: $PROJECT_NAME"
+        env:
+          PROJECT_NAME: opencad-studio
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+
+      # 7) 安装 EdgeOne CLI
+      #    官方包名是 'edgeone'。npx 在 runner 上常常拉不下来 / 拉到的版本不匹配，
+      #    统一用 npm 全局装，版本可锁定。
+      #    install 之后必须 --prefix 到 PATH 已包含的位置（npm -g 默认就在 npm 自己那个前缀下）。
+      - name: Install EdgeOne CLI
+        run: |
+          set -e
+          npm install -g edgeone@latest
+          # 把 npm 的全局 bin 目录塞进当前 PATH，防止 runner 的 PATH 还没刷新
+          export PATH="$(npm config get prefix)/bin:$PATH"
+          edgeone --version || { echo "edgeone 安装失败"; exit 1; }
+
+      # 8) 部署到 EdgeOne Pages
+      #    使用控制台已建好的项目名（PROJECT_NAME）。CLI 会推送 ./dist 到该项目。
+      #    部署完成后 CLI 会打印 production URL（形如 https://xxx.edgeone.app），
+      #    从日志里可以直接拿到访问地址。
       - name: Deploy to EdgeOne Pages
-        run: npx edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN"
+        run: |
+          set -e
+          export PATH="$(npm config get prefix)/bin:$PATH"
+          echo "开始部署到 EdgeOne Pages 项目: $PROJECT_NAME"
+          edgeone pages deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN"
+          echo "部署完成。访问地址（从上方日志的 production URL 行获取）："
         env:
           PROJECT_NAME: opencad-studio
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
