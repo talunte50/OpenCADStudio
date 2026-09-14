@@ -24,9 +24,11 @@ rustflags = [
     # than the optimized bundle. Keep modal construction from exhausting the
     # WebAssembly stack while developing with `trunk serve`.
     '-Clink-arg=-zstack-size=4194304',
-    # 以下两项启用 LTO，砍 wasm 体积（45MiB → 预计 25-30MiB）
-    '-Clto=thin',
-    '-Cembed-bitcode=yes',
+    # NOTE: 不加 -Clto=thin —— rustc 规定 LTO 只允许 executable / cdylib /
+    # staticlib 输出，而 OpenCAD 的依赖里有大量普通 lib crate（wasmtimer
+    # 等），target 级 rustflags 会给它们加 LTO 导致 "lto can only be run for
+    # executables, cdylibs and static library outputs" 错误。
+    # 体积优化只靠 deploy.yml 里 trunk build 后跑的 wasm-opt -O3。
 ]
 
 [target.x86_64-pc-windows-gnu]
