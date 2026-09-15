@@ -1,13 +1,10 @@
-// DIMJOGLINE command — add a jog (zigzag) symbol to a linear or aligned dimension.
-//
-// Workflow:
-//   1. Pick the dimension
-//   2. Click the position on the dimension line where the jog should appear
+// DIMJOGLINE — add or remove a jog on a linear/aligned dimension.
 
-use acadrust::Handle;
+use acadrust::entities::Dimension;
+use acadrust::{EntityType, Handle};
 use glam::DVec3;
 
-use crate::command::{CadCommand, CmdResult};
+use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
 use crate::modules::{IconKind, ModuleEvent, ToolDef};
 use crate::scene::model::wire_model::WireModel;
 use crate::t;
@@ -30,13 +27,65 @@ enum Step {
 
 pub struct DimJogLineCommand {
     step: Step,
+    remove: bool,
+    picked_entity: Option<EntityType>,
+    dimension: Option<Dimension>,
 }
 
 impl DimJogLineCommand {
     pub fn new() -> Self {
         Self {
             step: Step::PickDim,
+            remove: false,
+            picked_entity: None,
+            dimension: None,
         }
+    }
+
+    fn result(handle: Handle, point: Option<DVec3>) -> CmdResult {
+        CmdResult::EditDimensionJog {
+            dimension: handle,
+            point,
+        }
+    }
+
+    fn default_position(dimension: &Dimension) -> Option<DVec3> {
+        let (first, second, definition, axis) = match dimension {
+            Dimension::Linear(value) => (
+                value.first_point,
+                value.second_point,
+                value.definition_point,
+                DVec3::new(value.rotation.cos(), value.rotation.sin(), 0.0),
+            ),
+            Dimension::Aligned(value) => {
+                let first = DVec3::new(value.first_point.x, value.first_point.y, value.first_point.z);
+                let second = DVec3::new(value.second_point.x, value.second_point.y, value.second_point.z);
+                (
+                    value.first_point,
+                    value.second_point,
+                    value.definition_point,
+                    (second - first).try_normalize().unwrap_or(DVec3::X),
+                )
+            }
+            _ => return None,
+        };
+        let base = dimension.base();
+        let text = base.text_middle_point;
+        let normal = base.normal;
+        let text = if base.text_user_positioned {
+            [text.x, text.y, text.z]
+        } else {
+            [f64::NAN; 3]
+        };
+        cadkernel::space::default_dimension_jog_position(
+            [first.x, first.y, first.z],
+            [second.x, second.y, second.z],
+            [definition.x, definition.y, definition.z],
+            axis.to_array(),
+            [normal.x, normal.y, normal.z],
+            text,
+        )
+        .map(DVec3::from_array)
     }
 }
 
@@ -46,90 +95,151 @@ impl CadCommand for DimJogLineCommand {
     }
 
     fn prompt(&self) -> String {
-        match &self.step {
-            Step::PickDim => t!("DIMJOGLINE  Select linear or aligned dimension:").into_owned(),
-            Step::PickJogPos { .. } => t!("DIMJOGLINE  Specify jog location:").into_owned(),
+        match self.step {
+            Step::PickDim if self.remove => {
+                t!("DIMJOGLINE  Select dimension to remove jog:").into_owned()
+            }
+            Step::PickDim => {
+                t!("DIMJOGLINE  Select dimension to add jog or [Remove]:").into_owned()
+            }
+            Step::PickJogPos { .. } => {
+                t!("DIMJOGLINE  Specify jog location (or press Enter):").into_owned()
+            }
         }
+    }
+
+    fn options(&self) -> Vec<CmdOption> {
+        if matches!(self.step, Step::PickDim) && !self.remove {
+            vec![CmdOption::new("Remove", "REMOVE")]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn input_kind(&self) -> InputKind {
+        InputKind::Point
+    }
+
+    fn point_step_accepts_keywords(&self) -> bool {
+        matches!(self.step, Step::PickDim) && !self.remove
     }
 
     fn needs_entity_pick(&self) -> bool {
         matches!(self.step, Step::PickDim)
     }
 
-    fn on_entity_pick(&mut self, handle: Handle, _pt: DVec3) -> CmdResult {
+    fn inject_before_entity_pick(&self) -> bool {
+        matches!(self.step, Step::PickDim)
+    }
+
+    fn inject_picked_entity(&mut self, entity: EntityType) {
+        self.picked_entity = Some(entity);
+    }
+
+    fn on_entity_pick(&mut self, handle: Handle, _point: DVec3) -> CmdResult {
+        let Some(EntityType::Dimension(dimension @ (Dimension::Linear(_) | Dimension::Aligned(_)))) =
+            self.picked_entity.take()
+        else {
+            return CmdResult::ReportError(
+                t!("DIMJOGLINE: select a linear or aligned dimension.").into_owned(),
+            );
+        };
         if handle.is_null() {
             return CmdResult::NeedPoint;
         }
+        if self.remove {
+            return Self::result(handle, None);
+        }
+        self.dimension = Some(dimension);
         self.step = Step::PickJogPos { handle };
         CmdResult::NeedPoint
     }
 
-    fn on_point(&mut self, pt: DVec3) -> CmdResult {
-        if let Step::PickJogPos { handle } = &self.step {
-            let h = *handle;
-            // Emit sentinel for commands.rs to store the jog position
-            use acadrust::entities::XLine;
-            let mut xl = XLine::default();
-            xl.common.layer = format!("__DIMJOG__{},{:.6},{:.6}", h.value(), pt.x, pt.z);
-            return CmdResult::ReplaceEntity(h, vec![acadrust::EntityType::XLine(xl)]);
+    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
+        if matches!(self.step, Step::PickDim)
+            && matches!(text.trim().to_ascii_uppercase().as_str(), "R" | "REMOVE")
+        {
+            self.remove = true;
+            Some(CmdResult::NeedPoint)
+        } else {
+            None
         }
-        CmdResult::NeedPoint
+    }
+
+    fn on_point(&mut self, point: DVec3) -> CmdResult {
+        match self.step {
+            Step::PickJogPos { handle } => Self::result(handle, Some(point)),
+            Step::PickDim => CmdResult::NeedPoint,
+        }
     }
 
     fn on_enter(&mut self) -> CmdResult {
-        CmdResult::Cancel
+        match (&self.step, &self.dimension) {
+            (Step::PickJogPos { handle }, Some(dimension)) => Self::default_position(dimension)
+                .map(|point| Self::result(*handle, Some(point)))
+                .unwrap_or(CmdResult::Cancel),
+            _ => CmdResult::Cancel,
+        }
     }
 
-    fn on_mouse_move(&mut self, pt: DVec3) -> Option<WireModel> { let pt = pt.as_vec3();
+    fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
         if !matches!(self.step, Step::PickJogPos { .. }) {
             return None;
         }
-        let d = 0.3_f32;
-        Some(WireModel {
-            bg_adapt: None,
-            point_marker: None,
-            taper_widths: Vec::new(),
-            pattern_stations: Vec::new(),
-            world_width: 0.0,
-            depth_override: None,
-            display_visible: true,
-            plot_visible: true,
-            fill_is_3d: false,
-            fill_is_2d_solid: false,
-            render_instance: None,
-            pick_tris: Vec::new(),
-            pick_tris_low: Vec::new(),
-            dash_from_start: false,
-            dash_align_end: None,
-            text_verts: Vec::new(),
-            name: "dimjog_preview".into(),
-            // Jog zigzag in the XY drawing plane (Z is elevation, ~0). The old
-            // marker varied Z, so in the top-down view it collapsed to a flat
-            // line instead of a zigzag. (#150)
-            points: vec![
-                [pt.x - d, pt.y, pt.z],
-                [pt.x - d * 0.3, pt.y + d, pt.z],
-                [pt.x + d * 0.3, pt.y - d, pt.z],
-                [pt.x + d, pt.y, pt.z],
-            ],
-            points_low: Vec::new(),
-            color: WireModel::CYAN,
-            selected: false,
-            pattern_length: 0.0,
-            pattern: [0.0; 8],
-            line_weight_px: 1.2,
-            snap_pts: vec![],
-            tangent_geoms: vec![],
-            aci: 0,
-            key_vertices: vec![],
-            aabb: WireModel::UNBOUNDED_AABB,
-            plinegen: true,
-            fill_tris: vec![],
-            fill_tris_low: Vec::new(),
-        })
+        let dimension = self.dimension.as_ref()?;
+        let (segment, normal) = match dimension {
+            Dimension::Linear(value) => {
+                let axis = DVec3::new(value.rotation.cos(), value.rotation.sin(), 0.0);
+                (
+                    [(point - axis).to_array(), (point + axis).to_array()],
+                    [value.base.normal.x, value.base.normal.y, value.base.normal.z],
+                )
+            }
+            Dimension::Aligned(value) => (
+                [
+                    [value.first_point.x, value.first_point.y, value.first_point.z],
+                    [value.second_point.x, value.second_point.y, value.second_point.z],
+                ],
+                [value.base.normal.x, value.base.normal.y, value.base.normal.z],
+            ),
+            _ => return None,
+        };
+        let points = cadkernel::space::dimension_jog_points(
+            segment,
+            point.to_array(),
+            normal,
+            0.3,
+            std::f64::consts::FRAC_PI_2,
+        )?;
+        let mut preview = WireModel::default();
+        preview.name = "dimjog_preview".into();
+        preview.points = points
+            .into_iter()
+            .map(|point| point.map(|value| value as f32))
+            .collect();
+        preview.color = WireModel::CYAN;
+        preview.line_weight_px = 1.2;
+        Some(preview)
     }
 }
 
+inventory::submit!(crate::command::CommandRegistration { names: &["DIMJOGLINE"] });
 
-// ── Autocomplete registry ─────────────────────────────────
-inventory::submit!(crate::command::CommandRegistration { names: &["DIMJOGLINE"] });  // DimJogLineCommand
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jog_result_keeps_the_selected_point() {
+        let point = DVec3::new(1.0, 2.0, 3.0);
+        let CmdResult::EditDimensionJog {
+            dimension,
+            point: actual,
+        } = DimJogLineCommand::result(Handle::from(7), Some(point))
+        else {
+            panic!("expected dimension jog edit");
+        };
+        assert_eq!(dimension, Handle::from(7));
+        assert_eq!(actual, Some(point));
+    }
+}

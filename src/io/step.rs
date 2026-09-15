@@ -21,7 +21,7 @@ use std::fmt::Write as FmtWrite;
 pub fn build_step(meshes: &[&MeshModel]) -> Option<String> {
     // Collect all triangles as (v0, v1, v2, normal).
     struct Tri {
-        v: [[f32; 3]; 3],
+        v: [[f64; 3]; 3],
         n: [f32; 3],
     }
 
@@ -30,6 +30,13 @@ pub fn build_step(meshes: &[&MeshModel]) -> Option<String> {
         let verts = &mesh.verts;
         let normals = &mesh.normals;
         let idx = &mesh.indices;
+        // Positions are stored as an f32 half plus a low residual so they stay
+        // precise at survey coordinates; write the sum, as the renderer uses.
+        let point = |i: usize| {
+            let high = verts[i];
+            let low = mesh.verts_low.get(i).copied().unwrap_or([0.0; 3]);
+            [0, 1, 2].map(|k| high[k] as f64 + low[k] as f64)
+        };
         let n_tri = idx.len() / 3;
         for t in 0..n_tri {
             let i0 = idx[t * 3] as usize;
@@ -38,19 +45,24 @@ pub fn build_step(meshes: &[&MeshModel]) -> Option<String> {
             if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() {
                 continue;
             }
-            let a = verts[i0];
-            let b = verts[i1];
-            let c = verts[i2];
-            let n = if !normals.is_empty() && i0 < normals.len() {
+            let a = point(i0);
+            let b = point(i1);
+            let c = point(i2);
+            // The face is placed on the triangle's own plane. A smoothed vertex
+            // normal leans off it, so only a triangle whose cross product is
+            // zero falls back to the normal the mesh gives it. Small triangles
+            // have a tiny cross product but still a plane of their own.
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let nx = ab[1] * ac[2] - ab[2] * ac[1];
+            let ny = ab[2] * ac[0] - ab[0] * ac[2];
+            let nz = ab[0] * ac[1] - ab[1] * ac[0];
+            let len = nx.hypot(ny).hypot(nz);
+            let n = if len == 0.0 && i0 < normals.len() {
                 normals[i0]
             } else {
-                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                let nx = ab[1] * ac[2] - ab[2] * ac[1];
-                let ny = ab[2] * ac[0] - ab[0] * ac[2];
-                let nz = ab[0] * ac[1] - ab[1] * ac[0];
-                let len = (nx * nx + ny * ny + nz * nz).sqrt().max(f32::EPSILON);
-                [nx / len, ny / len, nz / len]
+                let len = len.max(f64::MIN_POSITIVE);
+                [(nx / len) as f32, (ny / len) as f32, (nz / len) as f32]
             };
             tris.push(Tri { v: [a, b, c], n });
         }
@@ -128,7 +140,7 @@ pub fn build_step(meshes: &[&MeshModel]) -> Option<String> {
                 tri.v[k1][1] - tri.v[k][1],
                 tri.v[k1][2] - tri.v[k][2],
             ];
-            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(f32::EPSILON);
+            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(f64::EPSILON);
             writeln!(
                 data,
                 "#{} = DIRECTION('',({:.6},{:.6},{:.6}));",
@@ -262,4 +274,140 @@ fn chrono_timestamp() -> String {
     let month = doy / 30 + 1;
     let day = doy % 30 + 1;
     format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_step;
+    use crate::scene::model::mesh_model::MeshModel;
+
+    fn triangle(verts: Vec<[f32; 3]>, verts_low: Vec<[f32; 3]>) -> MeshModel {
+        MeshModel {
+            name: String::new(),
+            verts,
+            verts_low,
+            normals: Vec::new(),
+            indices: vec![0, 1, 2],
+            triangle_material_handles: Vec::new(),
+            triangle_colors: Vec::new(),
+            color: [1.0; 4],
+            selected: false,
+        }
+    }
+
+    /// Split an absolute position into the f32 pair the tessellator stores.
+    fn split(point: [f64; 3]) -> ([f32; 3], [f32; 3]) {
+        let high = point.map(|v| v as f32);
+        let low = [0, 1, 2].map(|i| (point[i] - high[i] as f64) as f32);
+        (high, low)
+    }
+
+    /// At survey coordinates the f32 half alone is 6 cm coarse: 500000.123
+    /// is stored as 500000.125 plus a -0.002 residual. The export has to add
+    /// the residual back, as the renderer does.
+    #[test]
+    fn large_coordinates_keep_their_low_residual() {
+        let (verts, verts_low): (Vec<_>, Vec<_>) = [
+            [500000.123, 500010.456, 0.0],
+            [500001.123, 500010.456, 0.0],
+            [500000.123, 500011.456, 0.0],
+        ]
+        .into_iter()
+        .map(split)
+        .unzip();
+        let step = build_step(&[&triangle(verts, verts_low)]).expect("step");
+        assert!(
+            step.contains("CARTESIAN_POINT('',(500000.123000,500010.456000,0.000000));"),
+            "first vertex lost its residual:\n{}",
+            step.lines()
+                .find(|line| line.contains("CARTESIAN_POINT"))
+                .unwrap_or("")
+        );
+    }
+
+    /// Meshes without residuals (imported OBJ, legacy meshes) export as before.
+    #[test]
+    fn a_mesh_without_low_residuals_exports_its_positions() {
+        let mesh = triangle(
+            vec![[1.5, 2.0, 0.0], [2.5, 2.0, 0.0], [1.5, 3.0, 0.0]],
+            Vec::new(),
+        );
+        let step = build_step(&[&mesh]).expect("step");
+        assert!(step.contains("CARTESIAN_POINT('',(1.500000,2.000000,0.000000));"));
+    }
+
+    /// The direction each face's PLANE is placed with, read back through its
+    /// AXIS2_PLACEMENT_3D. The export writes one face per triangle.
+    fn plane_normals(step: &str) -> Vec<[f64; 3]> {
+        let direction = |id: &str| -> [f64; 3] {
+            let prefix = format!("{id} = DIRECTION('',(");
+            let line = step
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("no DIRECTION {id}"));
+            let values: Vec<f64> = line[prefix.len()..]
+                .trim_end_matches("));")
+                .split(',')
+                .map(|value| value.parse().expect("number"))
+                .collect();
+            [values[0], values[1], values[2]]
+        };
+        step.lines()
+            .filter_map(|line| line.split_once(" = AXIS2_PLACEMENT_3D('',"))
+            .map(|(_, refs)| {
+                let refs: Vec<&str> = refs.trim_end_matches(");").split(',').collect();
+                direction(refs[1])
+            })
+            .collect()
+    }
+
+    /// A curved surface shares smoothed normals across its facets, so a
+    /// vertex normal leans away from the triangle. The face's PLANE has to be
+    /// the triangle's own plane, or its corners do not lie on it.
+    #[test]
+    fn a_face_plane_follows_the_triangle_not_its_vertex_normal() {
+        let mut mesh = triangle(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            Vec::new(),
+        );
+        let leaning = [
+            std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ];
+        mesh.normals = vec![leaning; 3];
+        let step = build_step(&[&mesh]).expect("step");
+        assert_eq!(plane_normals(&step), vec![[0.0, 0.0, 1.0]]);
+    }
+
+    /// A small triangle still has a plane of its own. Its cross product is
+    /// tiny (1e-18 here), far below f64::EPSILON, but it is not zero.
+    #[test]
+    fn a_small_triangle_keeps_its_own_plane() {
+        let mut mesh = triangle(
+            vec![[0.0, 0.0, 0.0], [1e-9, 0.0, 0.0], [0.0, 1e-9, 0.0]],
+            Vec::new(),
+        );
+        let leaning = [
+            std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ];
+        mesh.normals = vec![leaning; 3];
+        let step = build_step(&[&mesh]).expect("step");
+        assert_eq!(plane_normals(&step), vec![[0.0, 0.0, 1.0]]);
+    }
+
+    /// A triangle with no area has no plane of its own, so it keeps the
+    /// normal the mesh gives it rather than a zero direction.
+    #[test]
+    fn a_degenerate_triangle_keeps_its_vertex_normal() {
+        let mut mesh = triangle(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            Vec::new(),
+        );
+        mesh.normals = vec![[0.0, 1.0, 0.0]; 3];
+        let step = build_step(&[&mesh]).expect("step");
+        assert_eq!(plane_normals(&step), vec![[0.0, 1.0, 0.0]]);
+    }
 }

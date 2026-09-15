@@ -7,9 +7,11 @@ pub(crate) fn automation_action_names() -> &'static [&'static str] {
 pub(crate) mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub use automation::{export_headless, serve};
+mod annotation_data;
 mod command_driver;
 pub(crate) mod commands;
 mod document;
+mod drafting_settings;
 pub(crate) mod expr_eval;
 mod find_replace;
 pub(crate) mod helpers;
@@ -258,12 +260,12 @@ pub(crate) enum FindMatchKey {
 }
 use crate::snap::Snapper;
 use crate::ui::{CommandLine, Ribbon, StatusBar};
-use acadrust::CadDocument;
 use acadrust::types::{Color as AcadColor, LineWeight};
+use acadrust::CadDocument;
 
 use iced::time::Instant;
 use iced::window;
-use iced::{Point, Task, Theme, mouse};
+use iced::{mouse, Point, Task, Theme};
 use std::sync::Arc;
 
 pub(super) const POLY_START_DELAY_MS: u128 = 150;
@@ -414,6 +416,9 @@ pub(super) struct OpenCADStudio {
     win_size: (f32, f32),
     snapper: Snapper,
     snap_popup_open: bool,
+    drafting_settings_state: Option<crate::ui::window::drafting_settings::DraftingSettingsState>,
+    drafting_settings_saved: Option<crate::ui::window::drafting_settings::DraftingSettingsState>,
+    drafting_settings_close_confirm: bool,
     scale_popup_open: bool,
     /// True while the polar-tracking angle picker is open.
     polar_popup_open: bool,
@@ -547,11 +552,7 @@ pub(super) struct OpenCADStudio {
     /// When true (default), the app registers itself as a .dwg/.dxf/.bak file
     /// handler on each launch. Toggle with the FILEASSOC command.
     pub file_assoc_enabled: bool,
-    /// When true, saving creates native constraint objects alongside the
-    /// application's own persistence record. Existing native objects remain
-    /// synchronized regardless of this setting.
-    pub write_dwg_native_constraints: bool,
-    /// When true (default), a sketch constraint's viewport pill shows its
+    /// When true (default), a parametric constraint's viewport pill shows its
     /// glyph plus a driven value or named-parameter name. When false, every
     /// pill shows only the glyph.
     pub show_constraint_values: bool,
@@ -1091,6 +1092,12 @@ pub(super) struct OpenCADStudio {
     /// Open transaction for the scale manager — restored if the window closes
     /// without Apply, mirroring the style managers' staging.
     scale_stage: Option<crate::app::style_ops::ScaleStage>,
+
+    // ── Annotation table/data dialogs ────────────────────────────────────
+    table_insert: crate::ui::window::annotation_data::TableInsertState,
+    data_link_manager: crate::ui::window::annotation_data::DataLinkManagerState,
+    data_link_parent_table: bool,
+    data_extraction: crate::ui::window::annotation_data::DataExtractionState,
 
     // ── Plot Style Panel ──────────────────────────────────────────────────
     /// Selected ACI index in the panel (1-255).
@@ -1747,6 +1754,9 @@ pub enum ModalKind {
     /// Add / remove the annotation scales a single selected object has a
     /// per-object representation for.
     AnnoObjectScale,
+    InsertTable,
+    DataLinkManager,
+    DataExtraction,
     /// The scene is drawn by a software rasterizer, or not at all: what that
     /// means and what usually fixes it. Queued once per verdict; the status
     /// bar's ⚠ pill reopens it.
@@ -2104,8 +2114,6 @@ pub enum Message {
     /// Register or unregister as the .dwg/.dxf handler, from Options. Same
     /// setting the FILEASSOC command carries.
     FileAssocChanged(bool),
-    /// Toggle writing native constraint objects on save.
-    WriteDwgNativeConstraintsChanged(bool),
     /// Toggle showing driven values/named-parameter names on constraint
     /// pills, from Options. See `show_constraint_values`'s doc comment.
     ShowConstraintValuesChanged(bool),
@@ -2533,9 +2541,9 @@ pub enum Message {
     /// Cycle the coordinate readout mode ($COORDS): static → live → polar.
     CycleCoordsMode,
     /// Removes one flagged redundant or conflicting constraint from the
-    /// current sketch scope.
+    /// current parametric scope.
     /// No-op if the scope currently has no flagged conflict.
-    ResolveOneSketchConflict,
+    ResolveOneParametricConflict,
     /// Toggle the status-bar customization menu open/closed.
     ToggleStatusBarMenu,
     /// Close the status-bar customization menu.
@@ -2609,6 +2617,29 @@ pub enum Message {
     SnapSelectAll,
     /// Disable all snap modes.
     SnapClearAll,
+    // ── Drafting Settings Dialog ──────────────────────────────────────────
+    DraftingSettingsTabChanged(crate::ui::window::drafting_settings::DraftingSettingsTab),
+    DraftingSettingsToggleGrid,
+    DraftingSettingsToggleSnap,
+    DraftingSettingsToggleIsometric,
+    DraftingSettingsSetIsoPlane(crate::app::settings::IsoPlane),
+    DraftingSettingsResetRotation,
+    DraftingSettingsTogglePolar,
+    DraftingSettingsToggleOrtho,
+    DraftingSettingsToggleOsnap,
+    DraftingSettingsToggleOtrack,
+    DraftingSettingsToggleSnapMode(crate::snap::SnapType),
+    DraftingSettingsSnapSelectAll,
+    DraftingSettingsSnapClearAll,
+    DraftingSettingsToggle3dOsnap,
+    DraftingSettingsToggleDynInput,
+    DraftingSettingsToggleQuickProps,
+    DraftingSettingsToggleSelCycling,
+    DraftingSettingsApply,
+    DraftingSettingsOk,
+    DraftingSettingsClose,
+    DraftingSettingsCloseDiscard,
+    DraftingSettingsCloseKeep,
     /// Toggle a ribbon dropdown open/closed.
     ToggleRibbonDropdown(String),
     /// Toggle a collapsed ribbon panel's flyout open/closed (by panel title).
@@ -3397,7 +3428,7 @@ pub enum Message {
     /// Open file-picker dialog for PDFATTACH command (async).
     PdfAttachPick,
     /// Result of the PDFATTACH file picker.
-    PdfAttachPickResult(Result<std::path::PathBuf, String>),
+    PdfAttachPickResult(Result<(std::path::PathBuf, std::sync::Arc<Vec<u8>>), String>),
 
     // ── XREF ──────────────────────────────────────────────────────────────
     /// Open file-picker dialog for XATTACH command (async).
@@ -3412,6 +3443,35 @@ pub enum Message {
     /// Background extraction/write completion.
     WblockWriteFinished(String, std::path::PathBuf, Result<(), String>),
     // ── DATAEXTRACTION ────────────────────────────────────────────────────
+    TableInsertStyle(String),
+    TableInsertField(crate::ui::window::annotation_data::TableInsertField),
+    TableInsertApply,
+    DataLinkManagerOpen,
+    DataLinkNew,
+    DataLinkSelect(acadrust::types::Handle),
+    DataLinkEdit,
+    DataLinkEditCancel,
+    DataLinkField(crate::ui::window::annotation_data::DataLinkField),
+    DataLinkBrowse,
+    DataLinkBrowseResult(Option<std::path::PathBuf>),
+    DataLinkSave,
+    DataLinkDelete,
+    DataLinkInsert,
+    DataLinkClose,
+    DataExtractionOpen,
+    DataExtractionField(crate::ui::window::annotation_data::DataExtractionField),
+    DataExtractionBack,
+    DataExtractionNext,
+    DataExtractionBrowseSettings,
+    DataExtractionBrowseSettingsResult(Option<std::path::PathBuf>),
+    DataExtractionAddDrawings,
+    DataExtractionAddDrawingsResult(Vec<std::path::PathBuf>),
+    DataExtractionAddFolder,
+    DataExtractionAddFolderResult(Option<std::path::PathBuf>),
+    DataExtractionClearSources,
+    DataExtractionBrowseOutput,
+    DataExtractionBrowseOutputResult(Option<std::path::PathBuf>),
+    DataExtractionFinish,
     /// Save the pre-built CSV string to a file chosen by the user.
     DataExtractionSave(String),
     /// Path chosen (or None = cancelled).
@@ -3509,6 +3569,9 @@ impl OpenCADStudio {
             win_size: (1280.0, 720.0),
             snapper: Snapper::default(),
             snap_popup_open: false,
+            drafting_settings_state: None,
+            drafting_settings_saved: None,
+            drafting_settings_close_confirm: false,
             scale_popup_open: false,
             polar_popup_open: false,
             polar_custom_input: String::new(),
@@ -3567,7 +3630,6 @@ impl OpenCADStudio {
             dimension_continue_mode: 1,
             backup_on_save: true,
             file_assoc_enabled: true,
-            write_dwg_native_constraints: false,
             show_constraint_values: true,
             savetime_min: 10,
             default_bg_color: None,
@@ -3780,6 +3842,10 @@ impl OpenCADStudio {
             anno_object_scale_target: None,
             scale_rename_buf: String::new(),
             scale_stage: None,
+            table_insert: Default::default(),
+            data_link_manager: Default::default(),
+            data_link_parent_table: false,
+            data_extraction: Default::default(),
             layout_manager_rename_buf: String::new(),
             plotstyle_panel_aci: 1,
             ps_color_buf: String::new(),

@@ -31,6 +31,9 @@ impl OpenCADStudio {
             Some(K::LayoutManager) => crate::tr!("modal", "layout-manager"),
             Some(K::ScaleManager) => crate::tr!("modal", "scale-manager"),
             Some(K::AnnoObjectScale) => crate::tr!("modal", "annotation-object-scale"),
+            Some(K::InsertTable) => crate::t!("Insert Table").into_owned(),
+            Some(K::DataLinkManager) => crate::t!("Data Link Manager").into_owned(),
+            Some(K::DataExtraction) => crate::t!("Data Extraction Wizard").into_owned(),
             Some(K::Plotstyle) => crate::tr!("modal", "plot-style-editor"),
             Some(K::TextStyle) => crate::tr!("modal", "text-style-manager"),
             Some(K::MlStyle) => crate::tr!("modal", "multiline-style-manager"),
@@ -198,7 +201,6 @@ impl OpenCADStudio {
                     crate::ui::window::options::view_window(
                         &self.default_save_format,
                         self.file_assoc_enabled,
-                        self.write_dwg_native_constraints,
                         self.show_constraint_values,
                         &self.ui_theme,
                         &self.theme_color_inputs,
@@ -283,25 +285,28 @@ impl OpenCADStudio {
                     )
                 },
             ),
-            super::super::ModalKind::DraftingSettings => sized_flow(
-                ex,
-                520,
-                560,
-                |flow| {
-                    crate::ui::window::drafting_settings::view_window(
-                        &self.snapper,
-                        self.show_grid,
-                        self.snapper.grid_snap(),
-                        self.ortho_mode,
-                        self.polar_mode,
-                        self.snapper.otrack_enabled,
-                        self.isometric_drafting,
-                        self.iso_plane,
-                        self.snap_angle_deg,
-                        flow,
-                    )
-                },
-            ),
+            super::super::ModalKind::DraftingSettings => {
+                let state = self.drafting_settings_state.as_ref();
+                let dirty = self.drafting_settings_dirty();
+                let confirm = self.drafting_settings_close_confirm;
+                sized_flow(
+                    ex,
+                    700,
+                    480,
+                    |flow| {
+                        if let Some(state) = state {
+                            crate::ui::window::drafting_settings::view_window(
+                                state,
+                                dirty,
+                                confirm,
+                                flow,
+                            )
+                        } else {
+                            iced::widget::Space::new().into()
+                        }
+                    },
+                )
+            }
             super::super::ModalKind::FindReplace => automatic_flow(ex, |flow| {
                 crate::ui::window::find_replace::view_window(
                     &self.find_replace.search,
@@ -581,6 +586,24 @@ impl OpenCADStudio {
                     },
                 )
             }
+            super::super::ModalKind::InsertTable => sized_flow(
+                ex,
+                620,
+                650,
+                |flow| crate::ui::window::annotation_data::table_insert_view(&self.table_insert, flow),
+            ),
+            super::super::ModalKind::DataLinkManager => sized_flow(
+                ex,
+                760,
+                560,
+                |flow| crate::ui::window::annotation_data::data_link_view(&self.data_link_manager, flow),
+            ),
+            super::super::ModalKind::DataExtraction => sized_flow(
+                ex,
+                780,
+                570,
+                |flow| crate::ui::window::annotation_data::data_extraction_view(&self.data_extraction, flow),
+            ),
             super::super::ModalKind::Plotstyle => sized_flow(
                 ex,
                 780,
