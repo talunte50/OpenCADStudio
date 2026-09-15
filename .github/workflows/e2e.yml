@@ -1,0 +1,70 @@
+name: E2E browser test
+
+# 独立的真实浏览器测试。刻意不做 Rust 构建 —— 只测「已经部署好的站点」，
+# 这样单次迭代约 2 分钟，而不是 12 分钟的完整构建。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '要测试的站点根地址'
+        required: true
+        default: 'https://opencad-studio.edgeone.dev'
+      timeout_ms:
+        description: '单步超时（毫秒）'
+        required: false
+        default: '180000'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Playwright + Chromium
+        run: |
+          set -e
+          npm init -y >/dev/null 2>&1
+          npm i playwright@latest --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Run E2E
+        id: run
+        continue-on-error: true
+        env:
+          E2E_URL: ${{ inputs.url }}
+          E2E_TIMEOUT_MS: ${{ inputs.timeout_ms }}
+        run: node scripts/e2e.mjs
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          if-no-files-found: warn
+          path: |
+            e2e-report.json
+            e2e-shot.png
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### E2E: ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 步骤结论: ${{ steps.run.outcome }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f e2e-report.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            python3 -c "import json;d=json.load(open('e2e-report.json'));print(json.dumps(d['summary'],indent=2,ensure_ascii=False));print(json.dumps(d.get('page'),indent=2,ensure_ascii=False))" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail if E2E failed
+        if: steps.run.outcome != 'success'
+        run: exit 1

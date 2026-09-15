@@ -1,4 +1,4 @@
-name: Build and Deploy to EdgeOne Pages
+name: Build and Deploy (EdgeOne overseas + Cloudflare Pages)
 
 on:
   push:
@@ -18,13 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      # 项目名 + 加速区域。
-      # 区域必须是 overseas（= 全球可用区(不含中国大陆)）：
-      #   - global（含中国大陆）下，免费域名只能用带 eo_token/eo_time 的预览链接访问，
-      #     3 小时就过期，超时返回 401；
-      #   - overseas 下，非中国大陆网络可直连，且绑定自定义域名无需工信部备案。
+      # ============ 项目名 / 加速区域 ============
+      # AREA 必须是 overseas（= 全球可用区(不含中国大陆)）。
+      # 注意：这个参数只在「项目不存在、需要新建」时生效！
+      # 如果同名项目已存在，EdgeOne CLI 会直接复用，区域参数被忽略 ——
+      # 这就是之前项目一直是 global（含中国大陆）、导致自定义域名必须备案、
+      # 无法绑定 cad.nxzai.cc.cd 的根因。
+      # 现在项目已用 API 以 Area=overseas 重建，预设域名为 *.edgeone.dev。
       PROJECT_NAME: opencad-studio
       AREA: overseas
+      # Cloudflare Pages 同名项目（cad.nxzai.cc.cd 已绑定在它上面）
+      CF_PROJECT_NAME: opencad-studio
     steps:
       # ================= 1. 构建 =================
       - name: Checkout repository
@@ -41,8 +45,7 @@ jobs:
 
       # 必须钉死版本，不能用 'latest'：
       #   latest 会漂移到 trunk v0.22.0-beta.x，该版本已不再接受 `--locked`，
-      #   会让 `trunk build --locked` 在第 8 步直接以 exit 2 失败（run #34876044442）。
-      #   v0.21.14 是当前最后一个正式版。
+      #   会让构建直接以 exit 2 失败（run #34876044442）。v0.21.14 是最后一个正式版。
       - name: Install Trunk
         uses: jetli/trunk-action@v0.4.0
         with:
@@ -75,10 +78,10 @@ jobs:
 
       # ================= 2. 压到 25MB 以内 =================
       # 上游产物 OpenCADStudio-<hash>_bg.wasm 约 45.3MiB，
-      # 而 EdgeOne Pages（以及 Cloudflare Pages）单文件上限都是 25MB，
+      # 而 EdgeOne Pages 与 Cloudflare Pages 的单文件上限都是 25MiB，
       # 45MiB 直接推会失败 —— 这是本站点 500 / 部署失败的最终根因。
       # 解法：brotli 预压缩成 ~9.4MiB，再把 .br 改名回 .wasm（保持引用路径不变），
-      #       最后由 edgeone.json 声明 Content-Encoding: br，浏览器自动解压。
+      #       最后由 edgeone.json / _headers 声明 Content-Encoding: br，浏览器自动解压。
       - name: Brotli-compress wasm
         run: |
           set -e
@@ -97,13 +100,21 @@ jobs:
           echo "=== 压缩后（按大小倒序前 20）==="
           find dist -type f -printf '%12s  %p\n' | sort -rn | head -20
 
-      # edgeone.json 必须放在「要上传的目录根部」，CLI 才会读到 headers 规则
+      # EdgeOne 的自定义响应头配置，必须放在「要上传的目录根部」
       - name: Add EdgeOne headers config
         run: |
           set -e
           cp .github/edgeone.json dist/edgeone.json
           echo "--- dist/edgeone.json ---"
           cat dist/edgeone.json
+
+      # Cloudflare Pages 的自定义响应头配置（_headers 必须在上传目录根部）
+      - name: Add Cloudflare Pages headers config
+        run: |
+          set -e
+          cp .github/cf_headers dist/_headers
+          echo "--- dist/_headers ---"
+          cat dist/_headers
 
       # 硬断言：任何一个文件 >= 25MB，部署一定失败，提前在这里挂掉
       - name: Assert no file exceeds 25MB
@@ -115,16 +126,15 @@ jobs:
           size=$(echo "$biggest" | cut -d' ' -f1)
           echo "最大文件: $biggest"
           if [ "$size" -ge "$LIMIT" ]; then
-            echo "::error::存在 >= 25MB 的文件（EdgeOne Pages 单文件硬上限），压缩没生效。"
+            echo "::error::存在 >= 25MB 的文件（平台单文件硬上限），压缩没生效。"
             exit 1
           fi
           echo "OK: index.html 存在，且全部文件均低于 25MB"
 
-      # ================= 3. 部署 =================
       - name: Pre-flight check
         run: |
           if [ -z "$EDGEONE_API_TOKEN" ]; then
-            echo "::error::EDGEONE_API_TOKEN 未设置。请到仓库 Settings → Secrets and variables → Actions 添加 secret 'EDGEONE_API_TOKEN'（值来自 EdgeOne Pages 控制台 → API Token）。"
+            echo "::error::EDGEONE_API_TOKEN 未设置。请到仓库 Settings → Secrets and variables → Actions 添加 secret 'EDGEONE_API_TOKEN'。"
             exit 1
           fi
           echo "EdgeOne Token 已设置，长度: ${#EDGEONE_API_TOKEN}"
@@ -132,6 +142,17 @@ jobs:
         env:
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
 
+      # 把 dist 传上去，便于本地复现 / 事后排查
+      - name: Upload dist artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          if-no-files-found: warn
+          retention-days: 7
+          path: dist
+
+      # ================= 3. 部署到 EdgeOne =================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -146,10 +167,6 @@ jobs:
           npm install -g edgeone@1.6.39
           edgeone --version
 
-          echo "---------- edgeone makers deploy --help ----------"
-          edgeone makers deploy --help || true
-          echo "--------------------------------------------------"
-
           if edgeone makers deploy ./dist -n "$PROJECT_NAME" -t "$EDGEONE_API_TOKEN" -e production -a "$AREA" 2>&1 | tee /tmp/eo_deploy.log; then
             echo "部署完成（makers deploy）"
           else
@@ -159,80 +176,61 @@ jobs:
           fi
 
           echo "---------- 部署日志要点 ----------"
-          grep -aiE 'area|Deploy URL|Project ID|Deploy Success' /tmp/eo_deploy.log || true
+          grep -aiE 'area|Deploy URL|Project ID|Deploy Success|already exists' /tmp/eo_deploy.log || true
 
-          URL=$(grep -aoE 'https://[A-Za-z0-9._-]+\.edgeone\.(cool|app|site)' /tmp/eo_deploy.log | head -1 || true)
+          # 海外区域项目的预设域名后缀是 .edgeone.dev；含中国大陆的是 .edgeone.cool ——
+          # 之前正则漏了 dev，会解析不到地址导致校验步骤直接失败。
+          URL=$(grep -aoE 'https://[A-Za-z0-9._-]+\.edgeone\.(cool|app|site|dev|cn)' /tmp/eo_deploy.log | head -1 || true)
+          if [ -z "$URL" ]; then
+            URL="https://${PROJECT_NAME}.edgeone.dev"
+            echo "::warning::没能从日志解析出地址，回退使用 $URL"
+          fi
           echo "deploy_url=$URL" >> "$GITHUB_OUTPUT"
           echo "解析到部署地址: $URL"
         env:
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
 
-      # ================= 4. 端到端校验（关键）=================
-      # runner 在美国 = 非中国大陆网络。区域为 overseas 时，免费域名可直连；
+      # ================= 4. EdgeOne 端到端校验 =================
+      # runner 在美国 = 非中国大陆网络。区域为 overseas 时免费域名可直连；
       # 区域为 global 时会回 401（免费域名只能用带 eo_token/eo_time 的 3 小时预览链接）。
-      - name: Verify deployed site end-to-end
+      - name: Verify EdgeOne site
+        run: bash .github/verify_site.sh "${{ steps.deploy.outputs.deploy_url }}"
+
+      # ================= 5. 同步部署到 Cloudflare Pages =================
+      # cad.nxzai.cc.cd 已绑定在 CF Pages 项目上（DNS 已解析、证书已签发），
+      # 之前一直 500 就是因为 45MiB 的 wasm 超过 CF 的 25MiB 上限。
+      # 压缩后文件 <10MiB，顺带把这条链路也修好，让自定义域名立刻可用。
+      - name: Deploy to Cloudflare Pages
+        id: cfdeploy
+        continue-on-error: true
         run: |
           set -eo pipefail
-          URL="${{ steps.deploy.outputs.deploy_url }}"
-          if [ -z "$URL" ]; then
-            echo "::error::没能从部署日志里解析出部署地址，无法校验"
-            exit 1
-          fi
-          BASE="${URL%/}"
-          echo "校验目标: $BASE"
+          python3 .github/cf_deploy.py
+          echo "=== CF 部署结果 ==="
+          cat /tmp/cf_deployment.json
+          CFURL=$(python3 -c "import json;print(json.load(open('/tmp/cf_deployment.json')).get('url',''))")
+          echo "cf_url=$CFURL" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
-          echo "===== 1) 首页 ====="
-          code=$(curl -s -o /tmp/idx.html -w '%{http_code}' -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' "$BASE/")
-          echo "HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::error::首页返回 $code，期望 200。"
-            head -c 500 /tmp/idx.html || true
-            echo
-            exit 1
-          fi
-          head -c 300 /tmp/idx.html; echo
+      - name: Verify Cloudflare Pages site
+        if: steps.cfdeploy.outcome == 'success'
+        continue-on-error: true
+        run: |
+          bash .github/verify_site.sh "https://${CF_PROJECT_NAME}.pages.dev"
+          echo "----- 自定义域名 cad.nxzai.cc.cd -----"
+          bash .github/verify_site.sh "https://cad.nxzai.cc.cd"
 
-          echo "===== 2) 定位 js / wasm ====="
-          JS=$(grep -aoE '/[A-Za-z0-9._-]+\.js' /tmp/idx.html | head -1 || true)
-          echo "js = $JS"
-          if [ -z "$JS" ]; then
-            echo "::error::index.html 里找不到 js 引用"
-            exit 1
-          fi
-          WASM="${JS%.js}_bg.wasm"
-          echo "wasm = $WASM"
-
-          echo "===== 3) wasm 响应头 ====="
-          curl -sI -A 'Mozilla/5.0' "$BASE$WASM" | sed -n '1,25p'
-
-          echo "===== 4) 实际下载并用 curl 解压 ====="
-          curl -s --compressed -A 'Mozilla/5.0' "$BASE$WASM" -o /tmp/app.wasm -w 'http=%{http_code} size_download=%{size_download}\n'
-          ls -l /tmp/app.wasm
-          magic=$(od -An -t x1 -N4 /tmp/app.wasm | tr -d ' \n')
-          echo "前 4 字节 = $magic  （期望 0061736d，即 \\0asm 魔数）"
-          if [ "$magic" != "0061736d" ]; then
-            echo "::error::wasm 解压后不是合法的 WebAssembly（前 4 字节 $magic）。Content-Encoding 链路有问题。"
-            exit 1
-          fi
-
-          echo "===== 5) worker wasm ====="
-          curl -sI -A 'Mozilla/5.0' "$BASE/worker_pkg/ocs_web_worker_bg.wasm" | sed -n '1,20p'
-          curl -s --compressed -A 'Mozilla/5.0' "$BASE/worker_pkg/ocs_web_worker_bg.wasm" -o /tmp/worker.wasm -w 'http=%{http_code} size_download=%{size_download}\n'
-          wmagic=$(od -An -t x1 -N4 /tmp/worker.wasm | tr -d ' \n')
-          echo "worker 前 4 字节 = $wmagic"
-          if [ "$wmagic" != "0061736d" ]; then
-            echo "::error::worker wasm 解压后不是合法的 WebAssembly"
-            exit 1
-          fi
-
-          echo "===== 6) 其它静态资源抽查 ====="
-          for p in "/${JS#/}" "/index.html" "/robots.txt"; do
-            c=$(curl -s -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' "$BASE$p" || true)
-            echo "  $p -> $c"
-          done
-
-          echo "============================================"
-          echo "  校验通过：站点可访问，wasm 解压后为合法 WebAssembly"
-          echo "  站点地址: $BASE"
-          echo "  自定义域名: https://cad.nxzai.cc.cd"
-          echo "============================================"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 部署结果"
+            echo ""
+            echo "- EdgeOne 部署: ${{ steps.deploy.outcome }}"
+            echo "- EdgeOne 地址: ${{ steps.deploy.outputs.deploy_url }}"
+            echo "- Cloudflare Pages 部署: ${{ steps.cfdeploy.outcome }}"
+            echo "- Cloudflare Pages 地址: https://${CF_PROJECT_NAME}.pages.dev"
+            echo "- 自定义域名: https://cad.nxzai.cc.cd"
+          } >> $GITHUB_STEP_SUMMARY
