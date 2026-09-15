@@ -269,12 +269,26 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
       - name: Verify Cloudflare Pages site
+        # continue-on-error：CF 侧存在账户级故障（连新建的空项目也返回 500/522，
+        # 与“边缘连不上 Pages 源站”一致），不应把 EdgeOne 这条独立链路连带判红。
+        # 但绝不能让它「绿着」蒙混过关 —— 把真实结果写进 step output 与 Summary，
+        # 失败时以 ::warning 显式暴露，避免误以为 CF 侧已经正常。
         if: always() && steps.cfdeploy.outcome == 'success'
+        id: cfverify
         continue-on-error: true
         run: |
-          bash .github/verify_site.sh "https://${CF_PROJECT_NAME}.pages.dev"
+          rc=0
+          bash .github/verify_site.sh "https://${CF_PROJECT_NAME}.pages.dev" || rc=1
           echo "----- 自定义域名 cad.nxzai.cc.cd -----"
-          bash .github/verify_site.sh "https://cad.nxzai.cc.cd"
+          bash .github/verify_site.sh "https://cad.nxzai.cc.cd" || rc=1
+          if [ "$rc" -eq 0 ]; then
+            echo "cf_verify=PASS" >> "$GITHUB_OUTPUT"
+            echo "Cloudflare Pages 校验通过"
+          else
+            echo "cf_verify=FAIL" >> "$GITHUB_OUTPUT"
+            echo "::warning::Cloudflare Pages 校验未通过（可能是账户级 500/522，非本仓库配置问题）；EdgeOne 链路不受影响"
+          fi
+          exit 0
 
       - name: Summary
         if: always()
@@ -288,4 +302,5 @@ jobs:
             echo "- Cloudflare Pages 地址: https://${CF_PROJECT_NAME}.pages.dev"
             echo "- 自定义域名: https://cad.nxzai.cc.cd"
             echo "- 交叉隔离(COOP/COEP): ${{ steps.isolation.outcome }}"
+            echo "- Cloudflare 站点校验: ${{ steps.cfverify.outputs.cf_verify }}"
           } >> $GITHUB_STEP_SUMMARY
