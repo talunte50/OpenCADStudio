@@ -137,6 +137,18 @@ iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00
 
 [profile.release]
 strip = true
+# 跨 crate 链接期优化：显著减小产物体积（对 wasm 尤其明显），同时提升运行时性能。
+lto = "fat"
+# 单编译单元，让优化器看到全部代码，进一步压缩体积。
+# 代价是构建变慢——首次冷构建可能从 20-40 分钟升到 1 小时左右，有缓存后仍可控。
+codegen-units = 1
+# 故意不设 panic = "abort"：本项目大量使用 std::panic::catch_unwind
+# （见 crates/ocs_plugin_api/src/runner.rs、src/plugin/mod.rs），
+# 用于把插件回调里的 panic 捕获成错误返回。abort 会让 catch_unwind 失效，
+# 插件一 panic 就整进程崩溃，属于行为回归，不能用。
+# 同理，故意不改全局 opt-level：同一份 profile 也用于桌面版编译，
+# "z"/"s" 会拖慢几何内核等计算密集代码。wasm 的体积优化交给 trunk 的
+# data-wasm-opt="z"（见 web-app.html），只影响 web 产物。
 
 [[bench]]
 name = "performance_benchmarks"
