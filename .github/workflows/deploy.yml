@@ -1,4 +1,4 @@
-name: Build and Deploy (EdgeOne overseas + Cloudflare Pages)
+name: Build and Deploy (EdgeOne overseas)
 
 on:
   push:
@@ -27,13 +27,11 @@ jobs:
       # 现在项目已用 API 以 Area=overseas 重建，预设域名为 *.edgeone.dev。
       PROJECT_NAME: opencad-studio
       AREA: overseas
-      # Cloudflare Pages 同名项目（cad.nxzai.cc.cd 已绑定在它上面）
-      CF_PROJECT_NAME: opencad-studio
 
       # EdgeOne 端到端校验的目标域名。
       # 不能用 CLI 输出的预设域名 <project>.edgeone.dev：实测它会返回 401
       # （要求带 eo_token/eo_time 的预览链接），偶尔返回 200 但内容是上一版缓存的
-      # index.html（引用的旧 hash 资源已 404），会让校验偶发失败并连带跳过 Cloudflare 步骤。
+      # index.html（引用的旧 hash 资源已 404），会让校验偶发失败。
       # 绑定后的自定义域名才是用户真实访问入口，用它校验最准确。
       EO_VERIFY_URL: https://cad.nxz.cc
     steps:
@@ -41,7 +39,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Rust + wasm32 目标。必须在 CI 上构建：EdgeOne / CF 的托管构建环境没有 Rust。
+      # Rust + wasm32 目标。必须在 CI 上构建：EdgeOne 的托管构建环境没有 Rust。
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -96,10 +94,10 @@ jobs:
 
       # ================= 2. 压到 25MB 以内 =================
       # 上游产物 OpenCADStudio-<hash>_bg.wasm 约 45.3MiB，
-      # 而 EdgeOne Pages 与 Cloudflare Pages 的单文件上限都是 25MiB，
+      # 而 EdgeOne Pages 的单文件上限是 25MiB，
       # 45MiB 直接推会失败 —— 这是本站点 500 / 部署失败的最终根因。
       # 解法：brotli 预压缩成 ~9.4MiB，再把 .br 改名回 .wasm（保持引用路径不变），
-      #       最后由 edgeone.json / _headers 声明 Content-Encoding: br，浏览器自动解压。
+      #       最后由 edgeone.json 声明 Content-Encoding: br，浏览器自动解压。
       - name: Brotli-compress wasm and fonts
         run: |
           set -e
@@ -127,14 +125,6 @@ jobs:
           cp .github/edgeone.json dist/edgeone.json
           echo "--- dist/edgeone.json ---"
           cat dist/edgeone.json
-
-      # Cloudflare Pages 的自定义响应头配置（_headers 必须在上传目录根部）
-      - name: Add Cloudflare Pages headers config
-        run: |
-          set -e
-          cp .github/cf_headers dist/_headers
-          echo "--- dist/_headers ---"
-          cat dist/_headers
 
       # 硬断言：任何一个文件 >= 25MB，部署一定失败，提前在这里挂掉
       - name: Assert no file exceeds 25MB
@@ -273,48 +263,6 @@ jobs:
           bh=$(curl -sI -A "$UA" -H 'Accept-Encoding: br' "$EO_VERIFY_URL/fonts/chinese.ttf" | tr -d '\r' || true)
           echo "$bh" | grep -i '^content-encoding:' || echo "::warning::fonts/chinese.ttf 未返回 Content-Encoding: br，字体预压缩可能未生效"
 
-      # ================= 5. 同步部署到 Cloudflare Pages =================
-      # cad.nxzai.cc.cd 已绑定在 CF Pages 项目上（DNS 已解析、证书已签发），
-      # 之前一直 500 就是因为 45MiB 的 wasm 超过 CF 的 25MiB 上限。
-      # 压缩后文件 <10MiB，顺带把这条链路也修好，让自定义域名立刻可用。
-      - name: Deploy to Cloudflare Pages
-        # always()：EdgeOne 校验失败不应连带跳过 CF 部署，两条链路互相独立
-        if: always()
-        id: cfdeploy
-        continue-on-error: true
-        run: |
-          set -eo pipefail
-          python3 .github/cf_deploy.py
-          echo "=== CF 部署结果 ==="
-          cat /tmp/cf_deployment.json
-          CFURL=$(python3 -c "import json;print(json.load(open('/tmp/cf_deployment.json')).get('url',''))")
-          echo "cf_url=$CFURL" >> "$GITHUB_OUTPUT"
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-
-      - name: Verify Cloudflare Pages site
-        # continue-on-error：CF 侧存在账户级故障（连新建的空项目也返回 500/522，
-        # 与“边缘连不上 Pages 源站”一致），不应把 EdgeOne 这条独立链路连带判红。
-        # 但绝不能让它「绿着」蒙混过关 —— 把真实结果写进 step output 与 Summary，
-        # 失败时以 ::warning 显式暴露，避免误以为 CF 侧已经正常。
-        if: always() && steps.cfdeploy.outcome == 'success'
-        id: cfverify
-        continue-on-error: true
-        run: |
-          rc=0
-          bash .github/verify_site.sh "https://${CF_PROJECT_NAME}.pages.dev" || rc=1
-          echo "----- 自定义域名 cad.nxzai.cc.cd -----"
-          bash .github/verify_site.sh "https://cad.nxzai.cc.cd" || rc=1
-          if [ "$rc" -eq 0 ]; then
-            echo "cf_verify=PASS" >> "$GITHUB_OUTPUT"
-            echo "Cloudflare Pages 校验通过"
-          else
-            echo "cf_verify=FAIL" >> "$GITHUB_OUTPUT"
-            echo "::warning::Cloudflare Pages 校验未通过（可能是账户级 500/522，非本仓库配置问题）；EdgeOne 链路不受影响"
-          fi
-          exit 0
-
       - name: Summary
         if: always()
         run: |
@@ -323,10 +271,7 @@ jobs:
             echo ""
             echo "- EdgeOne 部署: ${{ steps.deploy.outcome }}"
             echo "- EdgeOne 地址: ${{ steps.deploy.outputs.deploy_url }}"
-            echo "- Cloudflare Pages 部署: ${{ steps.cfdeploy.outcome }}"
-            echo "- Cloudflare Pages 地址: https://${CF_PROJECT_NAME}.pages.dev"
-            echo "- 自定义域名: https://cad.nxzai.cc.cd"
+            echo "- 生产域名: ${EO_VERIFY_URL}"
             echo "- 本次产物: ${{ steps.disthash.outputs.wasm_name }}"
             echo "- 交叉隔离(COOP/COEP): ${{ steps.isolation.outcome }}"
-            echo "- Cloudflare 站点校验: ${{ steps.cfverify.outputs.cf_verify }}"
           } >> $GITHUB_STEP_SUMMARY
