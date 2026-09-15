@@ -89,14 +89,16 @@ jobs:
       # 45MiB 直接推会失败 —— 这是本站点 500 / 部署失败的最终根因。
       # 解法：brotli 预压缩成 ~9.4MiB，再把 .br 改名回 .wasm（保持引用路径不变），
       #       最后由 edgeone.json / _headers 声明 Content-Encoding: br，浏览器自动解压。
-      - name: Brotli-compress wasm
+      - name: Brotli-compress wasm and fonts
         run: |
           set -e
           sudo apt-get update -qq
           sudo apt-get install -y -qq brotli
           echo "brotli 版本: $(brotli --version)"
 
-          for f in $(find dist -type f -name '*.wasm'); do
+          # .wasm 是 25MiB 单文件上限的正解；.ttf 是 EdgeOne 压缩 MIME 白名单
+          # 的漏网之鱼（实测 font/ttf 不压缩），10.3MiB 的中文字体只能预压缩。
+          for f in $(find dist -type f \( -name '*.wasm' -o -name '*.ttf' \)); do
             before=$(stat -c%s "$f")
             brotli -q 11 -f -o "$f.br" "$f"
             after=$(stat -c%s "$f.br")
@@ -216,6 +218,36 @@ jobs:
           echo "::error::连续 5 次校验失败: $EO_VERIFY_URL"
           exit 1
 
+      # ================= 4b. 交叉隔离 / 字体压缩 告警校验 =================
+      # 只告警、不失败：这两个头由 edgeone.json 声明，平台若不支持也不应把流水线判红。
+      # COOP+COEP 是 wasm 多线程（SharedArrayBuffer）的前提，缺了就只能单线程跑。
+      - name: Check cross-origin isolation and font compression
+        id: isolation
+        if: always()
+        continue-on-error: true
+        run: |
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+          ok_iso=0
+          for i in 1 2 3; do
+            H=$(curl -sI -A "$UA" "$EO_VERIFY_URL/" | tr -d '\r' || true)
+            if echo "$H" | grep -qi '^cross-origin-opener-policy:' && echo "$H" | grep -qi '^cross-origin-embedder-policy:'; then
+              echo "$H" | grep -i '^cross-origin-'
+              echo "OK COOP/COEP 已下发 —— 浏览器 crossOriginIsolated 将为 true"
+              ok_iso=1
+              break
+            fi
+            echo "第 $i 次未取到 COOP/COEP，30 秒后重试"
+            sleep 30
+          done
+          if [ "$ok_iso" -ne 1 ]; then
+            echo "::warning::未取到 COOP/COEP —— wasm 多线程（SharedArrayBuffer）不会启用"
+            echo "::warning::请确认 .github/edgeone.json 的 \"/*\" 规则已随产物部署"
+          fi
+
+          echo "----- 字体预压缩 -----"
+          bh=$(curl -sI -A "$UA" -H 'Accept-Encoding: br' "$EO_VERIFY_URL/fonts/chinese.ttf" | tr -d '\r' || true)
+          echo "$bh" | grep -i '^content-encoding:' || echo "::warning::fonts/chinese.ttf 未返回 Content-Encoding: br，字体预压缩可能未生效"
+
       # ================= 5. 同步部署到 Cloudflare Pages =================
       # cad.nxzai.cc.cd 已绑定在 CF Pages 项目上（DNS 已解析、证书已签发），
       # 之前一直 500 就是因为 45MiB 的 wasm 超过 CF 的 25MiB 上限。
@@ -255,4 +287,5 @@ jobs:
             echo "- Cloudflare Pages 部署: ${{ steps.cfdeploy.outcome }}"
             echo "- Cloudflare Pages 地址: https://${CF_PROJECT_NAME}.pages.dev"
             echo "- 自定义域名: https://cad.nxzai.cc.cd"
+            echo "- 交叉隔离(COOP/COEP): ${{ steps.isolation.outcome }}"
           } >> $GITHUB_STEP_SUMMARY
