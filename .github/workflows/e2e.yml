@@ -8,7 +8,7 @@ on:
       url:
         description: '要测试的站点根地址'
         required: true
-        default: 'https://opencad-studio.edgeone.dev'
+        default: 'https://cad.nxz.cc'
       timeout_ms:
         description: '单步超时（毫秒）'
         required: false
