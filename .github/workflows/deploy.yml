@@ -83,6 +83,17 @@ jobs:
           echo "=== 构建产物（按大小倒序前 20）==="
           find dist -type f -printf '%12s  %p\n' | sort -rn | head -20
 
+      # 记下本次构建产出的 wasm 文件名（trunk 按内容 hash 命名）。
+      # 后面的线上校验必须拿它做断言 —— 详见 Verify EdgeOne site 的注释。
+      - name: Resolve built wasm filename
+        id: disthash
+        run: |
+          set -e
+          WASM=$(basename "$(find dist -maxdepth 1 -name 'OpenCADStudio-*_bg.wasm' | head -1)")
+          test -n "$WASM" || { echo "::error::dist 里找不到 OpenCADStudio-*_bg.wasm"; exit 1; }
+          echo "wasm_name=$WASM" >> "$GITHUB_OUTPUT"
+          echo "本次构建 wasm 产物: $WASM"
+
       # ================= 2. 压到 25MB 以内 =================
       # 上游产物 OpenCADStudio-<hash>_bg.wasm 约 45.3MiB，
       # 而 EdgeOne Pages 与 Cloudflare Pages 的单文件上限都是 25MiB，
@@ -203,19 +214,33 @@ jobs:
       # runner 在美国 = 非中国大陆网络。区域为 overseas 时免费域名可直连；
       # 区域为 global 时会回 401（免费域名只能用带 eo_token/eo_time 的 3 小时预览链接）。
       - name: Verify EdgeOne site
+        env:
+          EXPECT_WASM: ${{ steps.disthash.outputs.wasm_name }}
         run: |
-          # 新部署在边缘节点的生效有几十秒传播窗口，失败就退避重试，
-          # 避免偶发 404 把整条流水线判红。
+          # 双重断言，共用同一套退避重试预算：
+          #   a) 可用性：verify_site.sh 端到端校验（首页 / 主 wasm / worker wasm / 静态资源）
+          #   b) 版本一致性：线上首页必须引用本次构建产出的 wasm 文件名
+          # 为什么必须有 b)：verify_site.sh 是从「线上首页」反推 wasm 路径的，
+          # 当 CDN 还在返回旧 index.html 时，旧首页引用旧资源会「自洽地」全部通过，
+          # 校验会假绿（run #34925339790 就是这样绿的，实际引用的还是上一版）。
+          # 只有与本地 dist 的产物文件名比对，才能证明新版本真的生效。
+          test -n "$EXPECT_WASM" || { echo "::error::EXPECT_WASM 为空，产物文件名未解析到"; exit 1; }
           for i in 1 2 3 4 5; do
             echo "----- 校验尝试 $i/5: $EO_VERIFY_URL -----"
             if bash .github/verify_site.sh "$EO_VERIFY_URL"; then
-              echo "校验通过: $EO_VERIFY_URL"
-              exit 0
+              # 用 identity 取未压缩首页：默认请求会拿到 brotli 二进制，grep 必然失配。
+              if curl -s -H 'Accept-Encoding: identity' -A 'Mozilla/5.0' "$EO_VERIFY_URL/" \
+                   | grep -qF "$EXPECT_WASM"; then
+                echo "校验通过: $EO_VERIFY_URL 已上线本次产物 $EXPECT_WASM"
+                exit 0
+              fi
+              echo "::warning::第 $i 次：站点可用，但线上首页未引用 $EXPECT_WASM（CDN 仍在返回旧 index.html）"
+            else
+              echo "::warning::第 $i 次校验失败，45 秒后重试"
             fi
-            echo "::warning::第 $i 次校验失败，45 秒后重试"
             sleep 45
           done
-          echo "::error::连续 5 次校验失败: $EO_VERIFY_URL"
+          echo "::error::连续 5 次校验失败: $EO_VERIFY_URL（期望线上首页引用本次产物 $EXPECT_WASM）"
           exit 1
 
       # ================= 4b. 交叉隔离 / 字体压缩 告警校验 =================
@@ -301,6 +326,7 @@ jobs:
             echo "- Cloudflare Pages 部署: ${{ steps.cfdeploy.outcome }}"
             echo "- Cloudflare Pages 地址: https://${CF_PROJECT_NAME}.pages.dev"
             echo "- 自定义域名: https://cad.nxzai.cc.cd"
+            echo "- 本次产物: ${{ steps.disthash.outputs.wasm_name }}"
             echo "- 交叉隔离(COOP/COEP): ${{ steps.isolation.outcome }}"
             echo "- Cloudflare 站点校验: ${{ steps.cfverify.outputs.cf_verify }}"
           } >> $GITHUB_STEP_SUMMARY
