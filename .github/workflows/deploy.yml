@@ -29,6 +29,13 @@ jobs:
       AREA: overseas
       # Cloudflare Pages 同名项目（cad.nxzai.cc.cd 已绑定在它上面）
       CF_PROJECT_NAME: opencad-studio
+
+      # EdgeOne 端到端校验的目标域名。
+      # 不能用 CLI 输出的预设域名 <project>.edgeone.dev：实测它会返回 401
+      # （要求带 eo_token/eo_time 的预览链接），偶尔返回 200 但内容是上一版缓存的
+      # index.html（引用的旧 hash 资源已 404），会让校验偶发失败并连带跳过 Cloudflare 步骤。
+      # 绑定后的自定义域名才是用户真实访问入口，用它校验最准确。
+      EO_VERIFY_URL: https://cad.nxz.cc
     steps:
       # ================= 1. 构建 =================
       - name: Checkout repository
@@ -194,13 +201,28 @@ jobs:
       # runner 在美国 = 非中国大陆网络。区域为 overseas 时免费域名可直连；
       # 区域为 global 时会回 401（免费域名只能用带 eo_token/eo_time 的 3 小时预览链接）。
       - name: Verify EdgeOne site
-        run: bash .github/verify_site.sh "${{ steps.deploy.outputs.deploy_url }}"
+        run: |
+          # 新部署在边缘节点的生效有几十秒传播窗口，失败就退避重试，
+          # 避免偶发 404 把整条流水线判红。
+          for i in 1 2 3 4 5; do
+            echo "----- 校验尝试 $i/5: $EO_VERIFY_URL -----"
+            if bash .github/verify_site.sh "$EO_VERIFY_URL"; then
+              echo "校验通过: $EO_VERIFY_URL"
+              exit 0
+            fi
+            echo "::warning::第 $i 次校验失败，45 秒后重试"
+            sleep 45
+          done
+          echo "::error::连续 5 次校验失败: $EO_VERIFY_URL"
+          exit 1
 
       # ================= 5. 同步部署到 Cloudflare Pages =================
       # cad.nxzai.cc.cd 已绑定在 CF Pages 项目上（DNS 已解析、证书已签发），
       # 之前一直 500 就是因为 45MiB 的 wasm 超过 CF 的 25MiB 上限。
       # 压缩后文件 <10MiB，顺带把这条链路也修好，让自定义域名立刻可用。
       - name: Deploy to Cloudflare Pages
+        # always()：EdgeOne 校验失败不应连带跳过 CF 部署，两条链路互相独立
+        if: always()
         id: cfdeploy
         continue-on-error: true
         run: |
@@ -215,7 +237,7 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
       - name: Verify Cloudflare Pages site
-        if: steps.cfdeploy.outcome == 'success'
+        if: always() && steps.cfdeploy.outcome == 'success'
         continue-on-error: true
         run: |
           bash .github/verify_site.sh "https://${CF_PROJECT_NAME}.pages.dev"
