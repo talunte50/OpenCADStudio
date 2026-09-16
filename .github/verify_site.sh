@@ -37,9 +37,17 @@ fi
 echo "OK 首页 200 且为 HTML"
 
 echo "----- 2) 解析 js / wasm 路径 -----"
-JS=$(grep -aoE '/[A-Za-z0-9._-]+\.js' /tmp/idx.html | head -1 || true)
+# 首页里可能有多个 .js 引用（例如我们注入的 GLSL 兼容补丁里带的说明文字），
+# 直接取第一个会挑错 —— 必须挑出「应用入口」：判据是同一页面里存在与之配对的 <name>_bg.wasm。
+CANDIDATES=$(grep -aoE '/[A-Za-z0-9._-]+\.js' /tmp/idx.html | sort -u || true)
+echo "  页面中全部 .js 引用: $(echo "$CANDIDATES" | tr '\n' ' ')"
+JS=""
+while IFS= read -r cand; do
+  [ -n "$cand" ] || continue
+  if grep -qF "${cand%.js}_bg.wasm" /tmp/idx.html; then JS="$cand"; break; fi
+done <<< "$CANDIDATES"
 if [ -z "$JS" ]; then
-  echo "::error::index.html 里找不到 js 引用"
+  echo "::error::index.html 里找不到与 *_bg.wasm 配对的 js 引用（候选: $(echo "$CANDIDATES" | tr '\n' ' ')）"
   exit 1
 fi
 WASM="${JS%.js}_bg.wasm"
