@@ -81,6 +81,19 @@ jobs:
           echo "=== 构建产物（按大小倒序前 20）==="
           find dist -type f -printf '%12s  %p\n' | sort -rn | head -20
 
+      # ================= 1b. 注入 WebGL2 GLSL 兼容补丁 =================
+      # 手机浏览器走 WebGL2(WebGL/GLES 后端) 时，naga 生成的 GLSL ES 里数组类型不带精度
+      # 限定符（`vec4 colors[8]`），而 ESSL 的 `precision highp float;` 不覆盖数组类型
+      # → 驱动报 S0032 拒绝编译 → wgpu 视作致命错误 → wasm panic → 首页直接弹渲染器错误。
+      # 补丁是纯前端运行期 hook（见 .github/glsl-webgl-shim.js），在构建产物上注入即可：
+      # 上游文件（src/、web-app.html、Trunk.toml、依赖）一行都不用改，同步上游没有冲突面。
+      # 脚本对「锚点缺失 / 写坏文件」一律 ::error:: 退出，不会静默失效。
+      - name: Inject WebGL GLSL precision shim
+        id: glslshim
+        run: |
+          set -e
+          python3 .github/inject_glsl_shim.py
+
       # 记下本次构建产出的 wasm 文件名（trunk 按内容 hash 命名）。
       # 后面的线上校验必须拿它做断言 —— 详见 Verify EdgeOne site 的注释。
       - name: Resolve built wasm filename
@@ -206,31 +219,38 @@ jobs:
       - name: Verify EdgeOne site
         env:
           EXPECT_WASM: ${{ steps.disthash.outputs.wasm_name }}
+          EXPECT_SHIM: ocs-glsl-shim
         run: |
-          # 双重断言，共用同一套退避重试预算：
+          # 三重断言，共用同一套退避重试预算：
           #   a) 可用性：verify_site.sh 端到端校验（首页 / 主 wasm / worker wasm / 静态资源）
           #   b) 版本一致性：线上首页必须引用本次构建产出的 wasm 文件名
+          #   c) 兼容补丁：线上首页必须含 WebGL2 GLSL 数组精度补丁
           # 为什么必须有 b)：verify_site.sh 是从「线上首页」反推 wasm 路径的，
           # 当 CDN 还在返回旧 index.html 时，旧首页引用旧资源会「自洽地」全部通过，
           # 校验会假绿（run #34925339790 就是这样绿的，实际引用的还是上一版）。
           # 只有与本地 dist 的产物文件名比对，才能证明新版本真的生效。
+          # 为什么也要 c)：补丁只在手机端才暴露价值，桌面 CI 跑不到 —— 只能断言首页内容，
+          # 否则「注入步骤被跳过 / 被上游结构变化破坏」会静默上线。
           test -n "$EXPECT_WASM" || { echo "::error::EXPECT_WASM 为空，产物文件名未解析到"; exit 1; }
           for i in 1 2 3 4 5; do
             echo "----- 校验尝试 $i/5: $EO_VERIFY_URL -----"
             if bash .github/verify_site.sh "$EO_VERIFY_URL"; then
               # 用 identity 取未压缩首页：默认请求会拿到 brotli 二进制，grep 必然失配。
-              if curl -s -H 'Accept-Encoding: identity' -A 'Mozilla/5.0' "$EO_VERIFY_URL/" \
-                   | grep -qF "$EXPECT_WASM"; then
-                echo "校验通过: $EO_VERIFY_URL 已上线本次产物 $EXPECT_WASM"
+              IDX=$(curl -s -H 'Accept-Encoding: identity' -A 'Mozilla/5.0' "$EO_VERIFY_URL/" || true)
+              if ! printf '%s' "$IDX" | grep -qF "$EXPECT_WASM"; then
+                echo "::warning::第 $i 次：站点可用，但线上首页未引用 $EXPECT_WASM（CDN 仍在返回旧 index.html）"
+              elif ! printf '%s' "$IDX" | grep -qF "$EXPECT_SHIM"; then
+                echo "::warning::第 $i 次：线上首页引用了本次产物，但缺少 GLSL 兼容补丁 '$EXPECT_SHIM'"
+              else
+                echo "校验通过: $EO_VERIFY_URL 已上线本次产物 $EXPECT_WASM，且含 GLSL 兼容补丁"
                 exit 0
               fi
-              echo "::warning::第 $i 次：站点可用，但线上首页未引用 $EXPECT_WASM（CDN 仍在返回旧 index.html）"
             else
               echo "::warning::第 $i 次校验失败，45 秒后重试"
             fi
             sleep 45
           done
-          echo "::error::连续 5 次校验失败: $EO_VERIFY_URL（期望线上首页引用本次产物 $EXPECT_WASM）"
+          echo "::error::连续 5 次校验失败: $EO_VERIFY_URL（期望线上首页引用 $EXPECT_WASM 且含 $EXPECT_SHIM）"
           exit 1
 
       # ================= 4b. 交叉隔离 / 字体压缩 告警校验 =================
@@ -273,5 +293,6 @@ jobs:
             echo "- EdgeOne 地址: ${{ steps.deploy.outputs.deploy_url }}"
             echo "- 生产域名: ${EO_VERIFY_URL}"
             echo "- 本次产物: ${{ steps.disthash.outputs.wasm_name }}"
+            echo "- GLSL 兼容补丁: ${{ steps.glslshim.outcome }}"
             echo "- 交叉隔离(COOP/COEP): ${{ steps.isolation.outcome }}"
           } >> $GITHUB_STEP_SUMMARY
